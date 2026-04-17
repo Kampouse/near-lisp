@@ -1855,3 +1855,218 @@ fn test_require_non_string_errors() {
         result
     );
 }
+
+// ===========================================================================
+// SECTION: Feature 1 — Stdlib caching
+// ===========================================================================
+
+#[test]
+fn test_stdlib_cached_require_same_module_twice() {
+    // Requiring the same module twice should still work and give same result
+    let code = r#"(require "math") (require "math") (abs -10)"#;
+    assert_eq!(eval_str(code), "10");
+}
+
+#[test]
+fn test_stdlib_cached_require_list_twice() {
+    let code = r#"(require "list") (require "list") (map (lambda (x) (* x 3)) (list 1 2))"#;
+    assert_eq!(eval_str(code), "(3 6)");
+}
+
+#[test]
+fn test_stdlib_cached_require_different_modules() {
+    let code = r#"(require "math") (require "string") (abs -7)"#;
+    assert_eq!(eval_str(code), "7");
+}
+
+#[test]
+fn test_stdlib_cached_require_saves_gas() {
+    // First require consumes gas; second require should consume almost none
+    // because it skips re-evaluation. We test that a low-gas second require works.
+    let code1 = r#"(require "math")"#;
+    let code2 = r#"(require "math") (min 3 5)"#;
+
+    // Load math with ample gas
+    let mut env = Vec::new();
+    run_program(code1, &mut env, 50_000).unwrap();
+
+    // Second require + call should work with low gas since require is cached
+    let result = run_program(code2, &mut env, 200).unwrap();
+    assert_eq!(result, "3");
+}
+
+// ===========================================================================
+// SECTION: Feature 2 — try/catch special form
+// ===========================================================================
+
+#[test]
+fn test_try_catch_basic_error() {
+    let code = r#"(try (/ 1 0) (catch e "caught"))"#;
+    assert_eq!(eval_str(code), "\"caught\"");
+}
+
+#[test]
+fn test_try_catch_success() {
+    let code = r#"(try (+ 1 2) (catch e "error"))"#;
+    assert_eq!(eval_str(code), "3");
+}
+
+#[test]
+fn test_try_catch_error_binding() {
+    let code = r#"(try (/ 1 0) (catch err err))"#;
+    let result = eval_str(code);
+    // Error message should be bound to `err` and returned as a string
+    assert!(result.contains("div by zero"), "got: {}", result);
+}
+
+#[test]
+fn test_try_catch_undefined_var() {
+    let code = r#"(try undefined_var (catch e (str-concat "caught: " e)))"#;
+    let result = eval_str(code);
+    assert!(result.contains("caught:"), "got: {}", result);
+    assert!(result.contains("undefined"), "got: {}", result);
+}
+
+#[test]
+fn test_try_catch_multi_body() {
+    // Handler with multiple body forms (progn-style)
+    let code = r#"
+        (try (/ 1 0)
+            (catch e
+                (define recovered "yes")
+                (str-concat "error:" e)))
+    "#;
+    let result = eval_str(code);
+    assert!(result.starts_with("\"error:"), "got: {}", result);
+}
+
+#[test]
+fn test_try_catch_gas_exhaustion() {
+    // Gas exhaustion from inner expression should be catchable.
+    // Need enough gas for: try form (1) + inner call form (1) + catch handler (1+)
+    // The inner near/storage-write fails when trying to evaluate its args with 0 gas,
+    // then the catch handler needs gas to evaluate "no-gas" string literal.
+    let code = r#"(try (near/storage-write "k" "v") (catch e "no-gas"))"#;
+    let result = eval_str_gas(code, 5);
+    assert_eq!(result, "\"no-gas\"");
+}
+
+#[test]
+fn test_try_catch_nested() {
+    let code = r#"
+        (try
+            (try (/ 1 0) (catch e (undefined_inner)))
+            (catch outer (str-concat "outer:" outer)))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("outer:"), "got: {}", result);
+}
+
+// ===========================================================================
+// SECTION: Feature 3 — str= and str!= builtins + string = comparison
+// ===========================================================================
+
+#[test]
+fn test_generic_eq_strings_equal() {
+    assert_eq!(eval_str(r#"(= "hello" "hello")"#), "true");
+}
+
+#[test]
+fn test_generic_eq_strings_not_equal() {
+    assert_eq!(eval_str(r#"(= "hello" "world")"#), "false");
+}
+
+#[test]
+fn test_str_eq_equal() {
+    assert_eq!(eval_str(r#"(str= "foo" "foo")"#), "true");
+}
+
+#[test]
+fn test_str_eq_not_equal() {
+    assert_eq!(eval_str(r#"(str= "foo" "bar")"#), "false");
+}
+
+#[test]
+fn test_str_neq_not_equal() {
+    assert_eq!(eval_str(r#"(str!= "foo" "bar")"#), "true");
+}
+
+#[test]
+fn test_str_neq_equal() {
+    assert_eq!(eval_str(r#"(str!= "foo" "foo")"#), "false");
+}
+
+#[test]
+fn test_str_eq_empty_strings() {
+    assert_eq!(eval_str(r#"(str= "" "")"#), "true");
+}
+
+#[test]
+fn test_str_eq_case_sensitive() {
+    assert_eq!(eval_str(r#"(str= "Hello" "hello")"#), "false");
+}
+
+// ===========================================================================
+// SECTION: Feature 4 — near/batch-call multi-action
+// ===========================================================================
+
+#[test]
+fn test_batch_call_basic() {
+    let code = r#"
+        (near/batch-call "test.near"
+            (list (list "method1" "{}" "0" "50")))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("batch:test.near:1"), "got: {}", result);
+}
+
+#[test]
+fn test_batch_call_multiple() {
+    let code = r#"
+        (near/batch-call "test.near"
+            (list
+                (list "method1" "{}" "0" "50")
+                (list "method2" "{}" "1000" "30")))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("batch:test.near:2"), "got: {}", result);
+}
+
+#[test]
+fn test_batch_call_empty_specs_error() {
+    let code = r#"
+        (near/batch-call "test.near" (list))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("ERROR"), "expected error: {}", result);
+    assert!(result.contains("at least one call spec"), "got: {}", result);
+}
+
+#[test]
+fn test_batch_call_invalid_recipient_error() {
+    let code = r#"
+        (near/batch-call "invalid account"
+            (list (list "method1" "{}" "0" "50")))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("ERROR"), "expected error: {}", result);
+}
+
+#[test]
+fn test_batch_call_short_spec_error() {
+    let code = r#"
+        (near/batch-call "test.near"
+            (list (list "method1" "{}")))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("ERROR"), "expected error: {}", result);
+    assert!(result.contains("each spec needs"), "got: {}", result);
+}
+
+#[test]
+fn test_batch_call_non_list_specs_error() {
+    let code = r#"(near/batch-call "test.near" "not a list")"#;
+    let result = eval_str(code);
+    assert!(result.contains("ERROR"), "expected error: {}", result);
+    assert!(result.contains("list of call specs"), "got: {}", result);
+}

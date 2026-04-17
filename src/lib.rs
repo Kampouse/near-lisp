@@ -540,6 +540,40 @@ pub fn lisp_eval(
                         let v = lisp_eval(list.get(1).ok_or("not: need arg")?, env, gas)?;
                         Ok(LispVal::Bool(!is_truthy(&v)))
                     }
+                    // try/catch: (try expr (catch error-var handler-body...))
+                    "try" => {
+                        let expr_to_try = list.get(1).ok_or("try: need expression")?;
+                        match lisp_eval(expr_to_try, env, gas) {
+                            Ok(val) => Ok(val),
+                            Err(err_msg) => {
+                                // Look for (catch error-var handler-body...)
+                                let catch_clause = list.get(2).ok_or("try: need catch clause")?;
+                                if let LispVal::List(clause) = catch_clause {
+                                    if clause.is_empty()
+                                        || clause[0] != LispVal::Sym("catch".into())
+                                    {
+                                        return Err(
+                                            "try: second arg must be (catch var body...)".into()
+                                        );
+                                    }
+                                    let error_var = match clause.get(1) {
+                                        Some(LispVal::Sym(s)) => s.clone(),
+                                        _ => return Err("try: catch needs a variable name".into()),
+                                    };
+                                    let mut local = env.clone();
+                                    local.push((error_var, LispVal::Str(err_msg)));
+                                    // Evaluate handler body forms (progn-style)
+                                    let mut r = LispVal::Nil;
+                                    for body_expr in &clause[2..] {
+                                        r = lisp_eval(body_expr, &mut local, gas)?;
+                                    }
+                                    Ok(r)
+                                } else {
+                                    Err("try: catch clause must be a list".into())
+                                }
+                            }
+                        }
+                    }
                     // Clojure-style loop/recur — tail-call optimization
                     "loop" => {
                         let bindings = match list.get(1) {
@@ -658,12 +692,19 @@ pub fn lisp_eval(
                             Some(LispVal::Str(s)) => s.as_str(),
                             _ => return Err("require: need string module name".into()),
                         };
+                        // Stdlib caching: check if module was already loaded
+                        let marker = format!("__stdlib_{}__", module_name);
+                        if env.iter().any(|(k, _)| k == &marker) {
+                            return Ok(LispVal::Nil);
+                        }
                         let code = get_stdlib_code(module_name)
                             .ok_or_else(|| format!("require: unknown module '{}'", module_name))?;
                         let module_exprs = parse_all(code)?;
                         for expr in &module_exprs {
                             lisp_eval(expr, env, gas)?;
                         }
+                        // Mark module as loaded
+                        env.push((marker, LispVal::Bool(true)));
                         Ok(LispVal::Nil)
                     }
                     _ => dispatch_call(list, env, gas),
@@ -853,6 +894,16 @@ fn dispatch_call(
                 let s = as_str(&args[0])?;
                 let suffix = as_str(args.get(1).ok_or("str-ends-with: need suffix")?)?;
                 Ok(LispVal::Bool(s.ends_with(&suffix)))
+            }
+            "str=" => {
+                let a = as_str(args.get(0).ok_or("str=: need 2 args")?)?;
+                let b = as_str(args.get(1).ok_or("str=: need 2 args")?)?;
+                Ok(LispVal::Bool(a == b))
+            }
+            "str!=" => {
+                let a = as_str(args.get(0).ok_or("str!=: need 2 args")?)?;
+                let b = as_str(args.get(1).ok_or("str!=: need 2 args")?)?;
+                Ok(LispVal::Bool(a != b))
             }
             "nil?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Nil))),
             "list?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::List(_)))),
@@ -1062,6 +1113,54 @@ fn dispatch_call(
                     "transfer:{}:{}",
                     amount_str, recipient_str
                 )))
+            }
+            "near/batch-call" => {
+                // (near/batch-call "recipient.near" (list (list "method" "{}" "0" "50") ...))
+                // Each inner list is [method, args_json, deposit_yocto, gas_tgas]
+                let recipient_str =
+                    as_str(&args[0]).map_err(|_| "near/batch-call: recipient must be string")?;
+                let recipient_id: AccountId = recipient_str
+                    .parse()
+                    .map_err(|_| "near/batch-call: invalid account id")?;
+                let call_specs = match args.get(1) {
+                    Some(LispVal::List(l)) => l,
+                    _ => {
+                        return Err("near/batch-call: second arg must be list of call specs".into())
+                    }
+                };
+                if call_specs.is_empty() {
+                    return Err("near/batch-call: need at least one call spec".into());
+                }
+                let mut promise = Promise::new(recipient_id);
+                let mut count = 0u64;
+                for spec in call_specs {
+                    if let LispVal::List(parts) = spec {
+                        if parts.len() < 4 {
+                            return Err("near/batch-call: each spec needs [method args_json deposit_yocto gas_tgas]".into());
+                        }
+                        let method = as_str(&parts[0])?;
+                        let args_json = as_str(&parts[1])?;
+                        let deposit_str = as_str(&parts[2])?;
+                        let gas_str = as_str(&parts[3])?;
+                        let deposit_u128: u128 = deposit_str
+                            .parse()
+                            .map_err(|_| "near/batch-call: invalid deposit")?;
+                        let gas_tgas: u64 = gas_str
+                            .parse()
+                            .map_err(|_| "near/batch-call: invalid gas")?;
+                        promise = promise.function_call(
+                            method,
+                            args_json.into_bytes(),
+                            NearToken::from_yoctonear(deposit_u128),
+                            Gas::from_tgas(gas_tgas),
+                        );
+                        count += 1;
+                    } else {
+                        return Err("near/batch-call: each call spec must be a list".into());
+                    }
+                }
+                let _ = promise;
+                Ok(LispVal::Str(format!("batch:{}:{}", recipient_str, count)))
             }
             "near/signer=" => {
                 let expected = as_str(&args[0])?;
