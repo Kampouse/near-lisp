@@ -2070,3 +2070,171 @@ fn test_batch_call_non_list_specs_error() {
     assert!(result.contains("ERROR"), "expected error: {}", result);
     assert!(result.contains("list of call specs"), "got: {}", result);
 }
+
+// ===========================================================================
+// SECTION: Feature 5 — Pattern matching (match special form)
+// ===========================================================================
+
+#[test]
+fn test_match_number_literal() {
+    assert_eq!(
+        eval_str("(match 42 (1 \"one\") (42 \"found\") (_ \"other\"))"),
+        "\"found\""
+    );
+}
+
+#[test]
+fn test_match_string_literal() {
+    let code = r#"(match "hello" ("world" 1) ("hello" 2) (_ 3))"#;
+    assert_eq!(eval_str(code), "2");
+}
+
+#[test]
+fn test_match_wildcard() {
+    assert_eq!(eval_str("(match 999 (_ \"matched\"))"), "\"matched\"");
+}
+
+#[test]
+fn test_match_binding_variable() {
+    assert_eq!(eval_str("(match 42 (?x (+ x 1)))"), "43");
+}
+
+#[test]
+fn test_match_list_pattern() {
+    assert_eq!(
+        eval_str("(match (list 1 2 3) ((list 1 2 3) \"matched\") (_ \"no\"))"),
+        "\"matched\""
+    );
+}
+
+#[test]
+fn test_match_list_pattern_with_bindings() {
+    assert_eq!(
+        eval_str("(match (list 10 20) ((list ?a ?b) (+ a b)) (_ 0))"),
+        "30"
+    );
+}
+
+#[test]
+fn test_match_list_pattern_wrong_length() {
+    assert_eq!(
+        eval_str("(match (list 1 2) ((list 1 2 3) \"yes\") (_ \"no\"))"),
+        "\"no\""
+    );
+}
+
+#[test]
+fn test_match_cons_pattern() {
+    assert_eq!(eval_str("(match (list 1 2 3) ((cons ?h ?t) h) (_ 0))"), "1");
+}
+
+#[test]
+fn test_match_cons_pattern_tail() {
+    assert_eq!(
+        eval_str("(match (list 1 2 3) ((cons ?h ?t) t) (_ (list)))"),
+        "(2 3)"
+    );
+}
+
+#[test]
+fn test_match_cons_empty_list_fails() {
+    assert_eq!(
+        eval_str("(match (list) ((cons ?h ?t) \"yes\") (_ \"empty\"))"),
+        "\"empty\""
+    );
+}
+
+#[test]
+fn test_match_bool_literal() {
+    assert_eq!(
+        eval_str("(match true (false \"no\") (true \"yes\"))"),
+        "\"yes\""
+    );
+}
+
+#[test]
+fn test_match_no_match_returns_nil() {
+    assert_eq!(eval_str("(match 5 (1 \"a\") (2 \"b\"))"), "nil");
+}
+
+#[test]
+fn test_match_nested() {
+    let code = r#"
+        (define classify
+            (lambda (x)
+                (match x
+                    ((list 1 ?rest) (str-concat "starts-1:" (to-json rest)))
+                    ((cons ?h ?t) (str-concat "head:" (to-json (list h))))
+                    (_ "other"))))
+        (classify (list 1 99))
+    "#;
+    let result = eval_str(code);
+    assert!(result.contains("starts-1:"), "got: {}", result);
+}
+
+// ===========================================================================
+// SECTION: Feature 6 — fmt string interpolation
+// ===========================================================================
+
+#[test]
+fn test_fmt_simple() {
+    let code = r#"(fmt "Hello {name}" (dict "name" "Alice"))"#;
+    assert_eq!(eval_str(code), "\"Hello Alice\"");
+}
+
+#[test]
+fn test_fmt_multiple_keys() {
+    let code = r#"(fmt "{greeting} {name}" (dict "greeting" "Hi" "name" "Bob"))"#;
+    assert_eq!(eval_str(code), "\"Hi Bob\"");
+}
+
+#[test]
+fn test_fmt_missing_key_left_as_is() {
+    let code = r#"(fmt "Hello {unknown}" (dict "name" "Alice"))"#;
+    assert_eq!(eval_str(code), "\"Hello {unknown}\"");
+}
+
+#[test]
+fn test_fmt_number_value() {
+    let code = r#"(fmt "Score: {score}" (dict "score" 95))"#;
+    assert_eq!(eval_str(code), "\"Score: 95\"");
+}
+
+#[test]
+fn test_fmt_bool_value() {
+    let code = r#"(fmt "Active: {status}" (dict "status" true))"#;
+    assert_eq!(eval_str(code), "\"Active: true\"");
+}
+
+#[test]
+fn test_fmt_empty_dict() {
+    let code = r#"(fmt "Hello {name}" (dict))"#;
+    assert_eq!(eval_str(code), "\"Hello {name}\"");
+}
+
+#[test]
+fn test_fmt_no_placeholders() {
+    let code = r#"(fmt "No placeholders" (dict))"#;
+    assert_eq!(eval_str(code), "\"No placeholders\"");
+}
+
+#[test]
+fn test_fmt_mixed_found_and_missing() {
+    let code = r#"(fmt "{a} {b} {c}" (dict "a" 1 "c" 3))"#;
+    assert_eq!(eval_str(code), "\"1 {b} 3\"");
+}
+
+// ===========================================================================
+// SECTION: Feature 7 — Custom modules (require integration)
+// ===========================================================================
+
+#[test]
+fn test_require_unknown_module_still_errors() {
+    let result = eval_str(r#"(require "nonexistent_module_xyz")"#);
+    assert!(result.contains("ERROR"), "expected error: {}", result);
+    assert!(
+        result.contains("unknown module"),
+        "expected 'unknown module': {}",
+        result
+    );
+}

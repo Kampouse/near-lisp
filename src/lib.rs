@@ -401,6 +401,105 @@ fn apply_lambda(
 }
 
 // ---------------------------------------------------------------------------
+// Pattern matching helper
+// ---------------------------------------------------------------------------
+
+fn match_pattern(pattern: &LispVal, value: &LispVal) -> Option<Vec<(String, LispVal)>> {
+    match pattern {
+        LispVal::Sym(s) if s == "_" => Some(vec![]),
+        LispVal::Sym(s) if s.starts_with('?') => {
+            // Binding variable — strip the '?' prefix
+            Some(vec![(s[1..].to_string(), value.clone())])
+        }
+        LispVal::Num(n) => {
+            if value == &LispVal::Num(*n) {
+                Some(vec![])
+            } else {
+                None
+            }
+        }
+        LispVal::Float(f) => {
+            if let LispVal::Float(vf) = value {
+                if (*f - *vf).abs() < f64::EPSILON {
+                    Some(vec![])
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        LispVal::Str(s) => {
+            if value == &LispVal::Str(s.clone()) {
+                Some(vec![])
+            } else {
+                None
+            }
+        }
+        LispVal::Bool(b) => {
+            if value == &LispVal::Bool(*b) {
+                Some(vec![])
+            } else {
+                None
+            }
+        }
+        LispVal::List(pats) if !pats.is_empty() => {
+            if let LispVal::Sym(s) = &pats[0] {
+                if s == "list" {
+                    // (list p1 p2 ...) — match list of same length
+                    if let LispVal::List(vals) = value {
+                        if vals.len() == pats.len() - 1 {
+                            let mut all_bindings = vec![];
+                            for (p, v) in pats[1..].iter().zip(vals.iter()) {
+                                if let Some(bindings) = match_pattern(p, v) {
+                                    all_bindings.extend(bindings);
+                                } else {
+                                    return None;
+                                }
+                            }
+                            Some(all_bindings)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else if s == "cons" && pats.len() == 3 {
+                    // (cons head tail) — match non-empty list
+                    if let LispVal::List(vals) = value {
+                        if !vals.is_empty() {
+                            let mut all_bindings = vec![];
+                            if let Some(b1) = match_pattern(&pats[1], &vals[0]) {
+                                all_bindings.extend(b1);
+                            } else {
+                                return None;
+                            }
+                            if let Some(b2) =
+                                match_pattern(&pats[2], &LispVal::List(vals[1..].to_vec()))
+                            {
+                                all_bindings.extend(b2);
+                            } else {
+                                return None;
+                            }
+                            Some(all_bindings)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Evaluator
 // ---------------------------------------------------------------------------
 
@@ -574,6 +673,27 @@ pub fn lisp_eval(
                             }
                         }
                     }
+                    // Pattern matching: (match expr (pattern1 result1) (pattern2 result2) ...)
+                    "match" => {
+                        let val = lisp_eval(list.get(1).ok_or("match: need expr")?, env, gas)?;
+                        for clause in &list[2..] {
+                            if let LispVal::List(parts) = clause {
+                                if parts.len() >= 2 {
+                                    if let Some(bindings) = match_pattern(&parts[0], &val) {
+                                        let mut local = env.clone();
+                                        for (name, v) in bindings {
+                                            local.push((name, v));
+                                        }
+                                        return parts
+                                            .get(1)
+                                            .map(|e| lisp_eval(e, &mut local, gas))
+                                            .unwrap_or(Ok(LispVal::Nil));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(LispVal::Nil) // no match = nil
+                    }
                     // Clojure-style loop/recur — tail-call optimization
                     "loop" => {
                         let bindings = match list.get(1) {
@@ -697,15 +817,29 @@ pub fn lisp_eval(
                         if env.iter().any(|(k, _)| k == &marker) {
                             return Ok(LispVal::Nil);
                         }
-                        let code = get_stdlib_code(module_name)
-                            .ok_or_else(|| format!("require: unknown module '{}'", module_name))?;
-                        let module_exprs = parse_all(code)?;
-                        for expr in &module_exprs {
-                            lisp_eval(expr, env, gas)?;
+                        // Try built-in stdlib first
+                        if let Some(code) = get_stdlib_code(module_name) {
+                            let module_exprs = parse_all(code)?;
+                            for expr in &module_exprs {
+                                lisp_eval(expr, env, gas)?;
+                            }
+                            env.push((marker, LispVal::Bool(true)));
+                            return Ok(LispVal::Nil);
                         }
-                        // Mark module as loaded
-                        env.push((marker, LispVal::Bool(true)));
-                        Ok(LispVal::Nil)
+                        // Try custom module from contract storage
+                        let storage_key = format!("module:{}", module_name);
+                        if let Some(bytes) = env::storage_read(storage_key.as_bytes()) {
+                            let code = String::from_utf8(bytes)
+                                .map_err(|_| "require: module has invalid utf8")?;
+                            let module_exprs = parse_all(&code)?;
+                            for expr in &module_exprs {
+                                lisp_eval(expr, env, gas)?;
+                            }
+                            env.push((marker, LispVal::Bool(true)));
+                            Ok(LispVal::Nil)
+                        } else {
+                            Err(format!("require: unknown module '{}'", module_name))
+                        }
                     }
                     _ => dispatch_call(list, env, gas),
                 }
@@ -1175,6 +1309,50 @@ fn dispatch_call(
                 ))
             }
 
+            "fmt" => {
+                let template = match &args[0] {
+                    LispVal::Str(s) => s.clone(),
+                    _ => return Err("fmt: need template string".into()),
+                };
+                let data = &args[1];
+                let mut result = String::new();
+                let chars: Vec<char> = template.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '{' {
+                        let mut key = String::new();
+                        i += 1;
+                        while i < chars.len() && chars[i] != '}' {
+                            key.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1;
+                        } // skip '}'
+                        let mut found = false;
+                        if let LispVal::Map(map) = data {
+                            if let Some(val) = map.get(&key) {
+                                // For string values, use the raw content (no quotes)
+                                match val {
+                                    LispVal::Str(s) => result.push_str(s),
+                                    _ => result.push_str(&val.to_string()),
+                                }
+                                found = true;
+                            }
+                        }
+                        if !found {
+                            result.push('{');
+                            result.push_str(&key);
+                            result.push('}');
+                        }
+                    } else {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                Ok(LispVal::Str(result))
+            }
+
             "to-json" => {
                 let json_val = lisp_to_json(&args[0]);
                 serde_json::to_string(&json_val)
@@ -1563,6 +1741,7 @@ pub struct LispContract {
     eval_gas_limit: u64,
     policy_names: IterableSet<String>,
     script_names: IterableSet<String>,
+    module_names: IterableSet<String>,
     eval_whitelist: IterableSet<AccountId>,
 }
 
@@ -1573,6 +1752,7 @@ impl Default for LispContract {
             eval_gas_limit: 10_000,
             policy_names: IterableSet::new(b"p"),
             script_names: IterableSet::new(b"s"),
+            module_names: IterableSet::new(b"m"),
             eval_whitelist: IterableSet::new(b"w"),
         }
     }
@@ -1591,6 +1771,7 @@ impl LispContract {
             },
             policy_names: IterableSet::new(b"p"),
             script_names: IterableSet::new(b"s"),
+            module_names: IterableSet::new(b"m"),
             eval_whitelist: IterableSet::new(b"w"),
         }
     }
@@ -1754,6 +1935,46 @@ impl LispContract {
         );
         env::storage_remove(format!("script:{}", name).as_bytes());
         self.script_names.remove(&name);
+    }
+
+    // --- Custom module management ---
+
+    /// Store a custom module (owner-only). Modules can be loaded via require.
+    pub fn save_module(&mut self, name: String, code: String) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner,
+            "Only owner can save modules"
+        );
+        // Validate: module must parse
+        match parse_all(&code) {
+            Ok(_) => {}
+            Err(e) => panic!("Module parse error: {}", e),
+        }
+        env::storage_write(format!("module:{}", name).as_bytes(), code.as_bytes());
+        self.module_names.insert(name);
+    }
+
+    /// View: get a stored module by name
+    pub fn get_module(&self, name: String) -> Option<String> {
+        env::storage_read(format!("module:{}", name).as_bytes())
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+    }
+
+    /// View: list all stored module names
+    pub fn list_modules(&self) -> Vec<String> {
+        self.module_names.iter().cloned().collect()
+    }
+
+    /// Delete a stored module (owner-only)
+    pub fn remove_module(&mut self, name: String) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner,
+            "Only owner can remove modules"
+        );
+        env::storage_remove(format!("module:{}", name).as_bytes());
+        self.module_names.remove(&name);
     }
 
     /// Delete a stored policy (owner-only)
