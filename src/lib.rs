@@ -120,7 +120,7 @@ pub enum LispVal {
     Lambda {
         params: Vec<String>,
         body: Box<LispVal>,
-        closed_env: std::rc::Rc<Vec<(String, LispVal)>>,
+        closed_env: Box<Vec<(String, LispVal)>>,
     },
     /// Internal: recur signal — loop/recur tail-call optimization
     Recur(Vec<LispVal>),
@@ -294,6 +294,76 @@ pub fn parse_all(input: &str) -> Result<Vec<LispVal>, String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Returns true if the name is a dispatch_call builtin — these evaluate to
+/// themselves as first-class values so they can be passed to map/reduce/etc.
+fn is_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "mod"
+            | "="
+            | "=="
+            | "!="
+            | "/="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "list"
+            | "car"
+            | "cdr"
+            | "cons"
+            | "len"
+            | "append"
+            | "nth"
+            | "str-concat"
+            | "str-contains"
+            | "to-string"
+            | "str-length"
+            | "str-substring"
+            | "str-split"
+            | "str-trim"
+            | "str-index-of"
+            | "str-upcase"
+            | "str-downcase"
+            | "str-starts-with"
+            | "str-ends-with"
+            | "str="
+            | "str!="
+            | "nil?"
+            | "list?"
+            | "number?"
+            | "string?"
+            | "map?"
+            | "to-float"
+            | "to-int"
+            | "to-num"
+            | "type?"
+            | "dict"
+            | "dict/get"
+            | "dict/set"
+            | "dict/has?"
+            | "dict/keys"
+            | "dict/vals"
+            | "dict/remove"
+            | "dict/merge"
+            | "error"
+            | "empty?"
+            | "range"
+            | "reverse"
+            | "sort"
+            | "zip"
+            | "map"
+            | "filter"
+            | "reduce"
+            | "find"
+            | "some"
+            | "every"
+    )
+}
+
 fn is_truthy(v: &LispVal) -> bool {
     !matches!(v, LispVal::Nil | LispVal::Bool(false))
 }
@@ -387,12 +457,12 @@ fn parse_params(val: &LispVal) -> Result<Vec<String>, String> {
 fn apply_lambda(
     params: &[String],
     body: &LispVal,
-    closed_env: &std::rc::Rc<Vec<(String, LispVal)>>,
+    closed_env: &Vec<(String, LispVal)>,
     args: &[LispVal],
     caller_env: &mut Vec<(String, LispVal)>,
     gas: &mut u64,
 ) -> Result<LispVal, String> {
-    let mut local = (**closed_env).clone();
+    let mut local = closed_env.clone();
     local.extend(caller_env.iter().cloned());
     for (i, p) in params.iter().enumerate() {
         local.push((p.clone(), args.get(i).cloned().unwrap_or(LispVal::Nil)));
@@ -522,12 +592,18 @@ pub fn lisp_eval(
         | LispVal::Lambda { .. }
         | LispVal::Map(_) => Ok(expr.clone()),
         LispVal::Recur(_) => Err("recur outside loop".into()),
-        LispVal::Sym(name) => env
-            .iter()
-            .rev()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| format!("undefined: {}", name)),
+        LispVal::Sym(name) => {
+            // Env bindings shadow builtins — check env first.
+            // If not found in env but it's a builtin name, return the
+            // symbol itself as a first-class callable value.
+            if let Some((_, v)) = env.iter().rev().find(|(k, _)| k == name) {
+                return Ok(v.clone());
+            }
+            if is_builtin_name(name) {
+                return Ok(expr.clone());
+            }
+            Err(format!("undefined: {}", name))
+        }
         LispVal::List(list) if list.is_empty() => Ok(LispVal::Nil),
         LispVal::List(list) => {
             if let LispVal::Sym(name) = &list[0] {
@@ -606,7 +682,7 @@ pub fn lisp_eval(
                         Ok(LispVal::Lambda {
                             params,
                             body: Box::new(body.clone()),
-                            closed_env: std::rc::Rc::new(env.clone()),
+                            closed_env: Box::new(env.clone()),
                         })
                     }
                     "progn" | "begin" => {
@@ -1039,7 +1115,10 @@ fn dispatch_call(
                 let b = as_str(args.get(1).ok_or("str!=: need 2 args")?)?;
                 Ok(LispVal::Bool(a != b))
             }
-            "nil?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Nil))),
+            "nil?" => Ok(LispVal::Bool(
+                matches!(&args[0], LispVal::Nil)
+                    || matches!(&args[0], LispVal::List(ref v) if v.is_empty()),
+            )),
             "list?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::List(_)))),
             "number?" => Ok(LispVal::Bool(matches!(
                 &args[0],
@@ -1366,6 +1445,165 @@ fn dispatch_call(
                 Ok(json_to_lisp(parsed))
             }
 
+            // --- List stdlib native builtins (zero stdlib gas overhead) ---
+            "empty?" => Ok(LispVal::Bool(
+                matches!(&args[0], LispVal::Nil)
+                    || matches!(&args[0], LispVal::List(ref v) if v.is_empty()),
+            )),
+
+            "range" => {
+                let start = as_num(args.get(0).ok_or("range: need 2 args")?)?;
+                let end = as_num(args.get(1).ok_or("range: need 2 args")?)?;
+                if start >= end {
+                    return Ok(LispVal::List(vec![]));
+                }
+                let vals: Vec<LispVal> = (start..end).map(LispVal::Num).collect();
+                Ok(LispVal::List(vals))
+            }
+
+            "reverse" => match &args[0] {
+                LispVal::List(l) => Ok(LispVal::List(l.iter().rev().cloned().collect())),
+                LispVal::Nil => Ok(LispVal::List(vec![])),
+                other => Err(format!("reverse: expected list, got {}", other)),
+            },
+
+            "sort" => {
+                let mut vals = match &args[0] {
+                    LispVal::List(l) => l.clone(),
+                    LispVal::Nil => vec![],
+                    other => return Err(format!("sort: expected list, got {}", other)),
+                };
+                vals.sort_by(|a, b| {
+                    let fa = match a {
+                        LispVal::Num(n) => *n as f64,
+                        LispVal::Float(f) => *f,
+                        _ => 0.0,
+                    };
+                    let fb = match b {
+                        LispVal::Num(n) => *n as f64,
+                        LispVal::Float(f) => *f,
+                        _ => 0.0,
+                    };
+                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(LispVal::List(vals))
+            }
+
+            "zip" => {
+                let a = match &args[0] {
+                    LispVal::List(l) => l.clone(),
+                    LispVal::Nil => vec![],
+                    other => return Err(format!("zip: expected list, got {}", other)),
+                };
+                let b = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => vec![],
+                    Some(other) => return Err(format!("zip: expected list, got {}", other)),
+                    None => return Err("zip: need 2 args".into()),
+                };
+                let pairs: Vec<LispVal> = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| LispVal::List(vec![x.clone(), y.clone()]))
+                    .collect();
+                Ok(LispVal::List(pairs))
+            }
+
+            "map" => {
+                let func = args.get(0).ok_or("map: need (f list)")?;
+                let lst = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(LispVal::List(vec![])),
+                    Some(other) => return Err(format!("map: expected list, got {}", other)),
+                    None => return Err("map: need (f list)".into()),
+                };
+                let mut result = Vec::with_capacity(lst.len());
+                for elem in &lst {
+                    result.push(call_val(func, &[elem.clone()], env, gas)?);
+                }
+                Ok(LispVal::List(result))
+            }
+
+            "filter" => {
+                let func = args.get(0).ok_or("filter: need (pred list)")?;
+                let lst = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(LispVal::List(vec![])),
+                    Some(other) => return Err(format!("filter: expected list, got {}", other)),
+                    None => return Err("filter: need (pred list)".into()),
+                };
+                let mut result = Vec::new();
+                for elem in &lst {
+                    if is_truthy(&call_val(func, &[elem.clone()], env, gas)?) {
+                        result.push(elem.clone());
+                    }
+                }
+                Ok(LispVal::List(result))
+            }
+
+            "reduce" => {
+                let func = args.get(0).ok_or("reduce: need (f init list)")?;
+                let mut acc = args.get(1).ok_or("reduce: need (f init list)")?.clone();
+                let lst = match args.get(2) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(acc),
+                    Some(other) => return Err(format!("reduce: expected list, got {}", other)),
+                    None => return Err("reduce: need (f init list)".into()),
+                };
+                for elem in &lst {
+                    acc = call_val(func, &[acc.clone(), elem.clone()], env, gas)?;
+                }
+                Ok(acc)
+            }
+
+            "find" => {
+                let func = args.get(0).ok_or("find: need (pred list)")?;
+                let lst = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(LispVal::Nil),
+                    Some(other) => return Err(format!("find: expected list, got {}", other)),
+                    None => return Err("find: need (pred list)".into()),
+                };
+                for elem in &lst {
+                    if is_truthy(&call_val(func, &[elem.clone()], env, gas)?) {
+                        return Ok(elem.clone());
+                    }
+                }
+                Ok(LispVal::Nil)
+            }
+
+            "some" => {
+                let func = args.get(0).ok_or("some: need (pred list)")?;
+                let lst = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(LispVal::Bool(false)),
+                    Some(other) => return Err(format!("some: expected list, got {}", other)),
+                    None => return Err("some: need (pred list)".into()),
+                };
+                for elem in &lst {
+                    if is_truthy(&call_val(func, &[elem.clone()], env, gas)?) {
+                        return Ok(LispVal::Bool(true));
+                    }
+                }
+                Ok(LispVal::Bool(false))
+            }
+
+            "every" => {
+                let func = args.get(0).ok_or("every: need (pred list)")?;
+                let lst = match args.get(1) {
+                    Some(LispVal::List(l)) => l.clone(),
+                    Some(LispVal::Nil) => return Ok(LispVal::Bool(true)),
+                    Some(other) => return Err(format!("every: expected list, got {}", other)),
+                    None => return Err("every: need (pred list)".into()),
+                };
+                for elem in &lst {
+                    if !is_truthy(&call_val(func, &[elem.clone()], env, gas)?) {
+                        return Ok(LispVal::Bool(false));
+                    }
+                }
+                Ok(LispVal::Bool(true))
+            }
+
             _ => {
                 // Lambda lookup
                 let func = env
@@ -1390,7 +1628,7 @@ fn dispatch_call(
             return Err("inline lambda too short".into());
         }
         let params = parse_params(&ll[1])?;
-        apply_lambda(&params, &ll[2], &std::rc::Rc::new(vec![]), &args, env, gas)
+        apply_lambda(&params, &ll[2], &vec![], &args, env, gas)
     } else {
         Err("not callable".into())
     }
@@ -1410,7 +1648,14 @@ fn call_val(
         } => apply_lambda(params, body, closed_env, args, env, gas),
         LispVal::List(ll) if ll.len() >= 3 => {
             let params = parse_params(&ll[1])?;
-            apply_lambda(&params, &ll[2], &std::rc::Rc::new(vec![]), args, env, gas)
+            apply_lambda(&params, &ll[2], &vec![], args, env, gas)
+        }
+        LispVal::Sym(name) => {
+            // Allow raw builtin names as first-class functions:
+            // (reduce + 0 (list 1 2 3)) works because + is dispatched natively.
+            let mut call = vec![func.clone()];
+            call.extend(args.iter().cloned());
+            dispatch_call(&call, env, gas)
         }
         _ => Err(format!("not callable: {}", func)),
     }
@@ -1483,25 +1728,31 @@ pub fn lisp_to_json(val: &LispVal) -> serde_json::Value {
 /// Stored in contract storage between yield and resume.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct VmState {
-    /// Remaining top-level expressions to evaluate on resume.
+    /// Remaining top-level expressions to evaluate on resume
+    /// (after all pending ccalls complete).
     pub remaining: Vec<LispVal>,
     /// Accumulated environment bindings.
     pub env: Vec<(String, LispVal)>,
     /// Gas remaining.
     pub gas: u64,
-    /// Variable name being defined when yield happened.
+    /// Variable names for each pending ccall.
+    /// Each entry corresponds to one ccall in the batch.
     /// `Some("price")` for `(define price (near/ccall ...))`
     /// `None` for standalone `(near/ccall ...)`
-    pub pending_var: Option<String>,
+    pub pending_vars: Vec<Option<String>>,
 }
 
 /// Result of running a program that may contain cross-contract calls.
 pub enum RunResult {
     /// Evaluation completed synchronously.
     Done(String),
-    /// Evaluation paused at a cross-contract call. Contains everything needed
-    /// to create the promise, yield, and resume later.
-    Yield(CcallYield),
+    /// Evaluation paused at one or more cross-contract calls.
+    /// All ccalls found before a non-ccall expression are batched
+    /// into a single yield cycle for parallel execution.
+    Yield {
+        yields: Vec<CcallYield>,
+        state: VmState,
+    },
 }
 
 /// Pending cross-contract call that requires a yield.
@@ -1509,7 +1760,6 @@ pub struct CcallYield {
     pub account: String,
     pub method: String,
     pub args_bytes: Vec<u8>,
-    pub state: VmState,
     /// Deposit in yoctoNEAR (0 for view calls).
     pub deposit: u128,
     /// Gas in TeraGas (50 TGas default for view calls).
@@ -1646,8 +1896,10 @@ fn check_ccall(
 }
 
 /// Run a program that may contain cross-contract calls.
-/// Returns `RunResult::Yield` if a `(near/ccall ...)` is encountered at the
-/// top level, with the full VM state captured for later resumption.
+///
+/// Scans ALL top-level expressions upfront and batches consecutive ccalls
+/// into a single yield cycle. Returns `RunResult::Yield(Vec<CcallYield>)`
+/// with all ccalls found before the first non-ccall expression.
 pub fn run_program_with_ccall(
     code: &str,
     env: &mut Vec<(String, LispVal)>,
@@ -1657,23 +1909,59 @@ pub fn run_program_with_ccall(
     let mut gas = gas_limit;
     let mut result = LispVal::Nil;
 
+    // Collect all consecutive ccalls from the top
+    let mut batch = Vec::new();
+    let mut first_non_ccall = 0;
+
     for (i, expr) in exprs.iter().enumerate() {
-        // Before evaluating, check if this expression requires a ccall yield
         if let Some(ccall_info) = check_ccall(expr, env, &mut gas)? {
-            return Ok(RunResult::Yield(CcallYield {
-                account: ccall_info.account,
-                method: ccall_info.method,
-                args_bytes: ccall_info.args_bytes,
-                deposit: ccall_info.deposit,
-                gas_tgas: ccall_info.gas_tgas,
-                state: VmState {
-                    remaining: exprs[i + 1..].to_vec(),
-                    env: env.clone(),
-                    gas,
-                    pending_var: ccall_info.pending_var,
-                },
-            }));
+            batch.push(ccall_info);
+            first_non_ccall = i + 1;
+        } else {
+            break;
         }
+    }
+
+    if !batch.is_empty() {
+        let yields: Vec<CcallYield> = batch
+            .into_iter()
+            .map(|info| CcallYield {
+                account: info.account,
+                method: info.method,
+                args_bytes: info.args_bytes,
+                deposit: info.deposit,
+                gas_tgas: info.gas_tgas,
+            })
+            .collect();
+
+        // Extract pending_vars from check_ccall results
+        let mut pending_vars = Vec::new();
+        let mut gas2 = gas_limit;
+        let mut env2 = env.clone();
+        for (i, expr) in exprs.iter().enumerate() {
+            if i >= first_non_ccall {
+                break;
+            }
+            if let Some(ccall_info) = check_ccall(expr, &mut env2, &mut gas2)? {
+                pending_vars.push(ccall_info.pending_var);
+            }
+        }
+        *env = env2;
+        gas = gas2;
+
+        return Ok(RunResult::Yield {
+            yields,
+            state: VmState {
+                remaining: exprs[first_non_ccall..].to_vec(),
+                env: env.clone(),
+                gas,
+                pending_vars,
+            },
+        });
+    }
+
+    // No ccalls — evaluate normally
+    for expr in exprs.iter() {
         result = lisp_eval(expr, env, &mut gas)?;
     }
 
@@ -1690,23 +1978,59 @@ pub fn run_remaining_with_ccall(
 ) -> Result<RunResult, String> {
     let mut result = LispVal::Nil;
 
+    // Collect all consecutive ccalls from the top
+    let mut batch = Vec::new();
+    let mut first_non_ccall = 0;
+
     for (i, expr) in exprs.iter().enumerate() {
-        // Before evaluating, check if this expression requires a ccall yield
         if let Some(ccall_info) = check_ccall(expr, env, gas)? {
-            return Ok(RunResult::Yield(CcallYield {
-                account: ccall_info.account,
-                method: ccall_info.method,
-                args_bytes: ccall_info.args_bytes,
-                deposit: ccall_info.deposit,
-                gas_tgas: ccall_info.gas_tgas,
-                state: VmState {
-                    remaining: exprs[i + 1..].to_vec(),
-                    env: env.clone(),
-                    gas: *gas,
-                    pending_var: ccall_info.pending_var,
-                },
-            }));
+            batch.push(ccall_info);
+            first_non_ccall = i + 1;
+        } else {
+            break;
         }
+    }
+
+    if !batch.is_empty() {
+        let yields: Vec<CcallYield> = batch
+            .into_iter()
+            .map(|info| CcallYield {
+                account: info.account,
+                method: info.method,
+                args_bytes: info.args_bytes,
+                deposit: info.deposit,
+                gas_tgas: info.gas_tgas,
+            })
+            .collect();
+
+        // Extract pending_vars from check_ccall results
+        let mut pending_vars = Vec::new();
+        let mut gas2 = *gas;
+        let mut env2 = env.clone();
+        for (i, expr) in exprs.iter().enumerate() {
+            if i >= first_non_ccall {
+                break;
+            }
+            if let Some(ccall_info) = check_ccall(expr, &mut env2, &mut gas2)? {
+                pending_vars.push(ccall_info.pending_var);
+            }
+        }
+        *env = env2;
+        *gas = gas2;
+
+        return Ok(RunResult::Yield {
+            yields,
+            state: VmState {
+                remaining: exprs[first_non_ccall..].to_vec(),
+                env: env.clone(),
+                gas: *gas,
+                pending_vars,
+            },
+        });
+    }
+
+    // No ccalls — evaluate normally
+    for expr in exprs.iter() {
         result = lisp_eval(expr, env, gas)?;
     }
 
@@ -2074,24 +2398,21 @@ impl LispContract {
         ));
         match run_program_with_ccall(&code, &mut eval_env, self.eval_gas_limit) {
             Ok(RunResult::Done(result)) => result,
-            Ok(RunResult::Yield(yi)) => Self::setup_yield_chain(yi),
+            Ok(RunResult::Yield { yields, state }) => Self::setup_batch_yield_chain(yields, state),
             Err(e) => format!("ERROR: {}", e),
         }
     }
 
-    /// Yield callback — resumes evaluation after the cross-contract call completes.
+    /// Yield callback — resumes evaluation after ALL batched cross-contract calls complete.
     ///
     /// Called automatically by NEAR's yield/resume mechanism when
-    /// `promise_yield_resume` is invoked by `auto_resume_ccall`.
+    /// `promise_yield_resume` is invoked by `auto_resume_batch_ccall`.
     ///
     /// Flow:
-    ///   1. auto_resume_ccall calls promise_yield_resume(data_id, result)
-    ///   2. NEAR delivers the result to this deferred receipt
-    ///   3. This method deserializes VmState, injects the result, continues eval
-    ///
-    /// Re-yielding: if the remaining expressions contain another ccall, this
-    /// method will yield AGAIN — creating a new yield+ccall chain. This enables
-    /// multiple cross-contract calls in sequence.
+    ///   1. auto_resume_batch_ccall collects all N ccall results,
+    ///      borsh-serializes them, calls promise_yield_resume(data_id, results)
+    ///   2. NEAR delivers the results to this deferred receipt
+    ///   3. This method deserializes VmState, injects ALL results, continues eval
     pub fn resume_eval(&mut self, yield_id: String) -> String {
         // Guard: must be called as yield callback (has promise results)
         assert!(
@@ -2105,86 +2426,98 @@ impl LispContract {
         let state: VmState =
             borsh::from_slice(&state_bytes).unwrap_or_else(|e| panic!("Corrupt VM state: {}", e));
 
-        // Read cross-contract result from yield_resume payload
-        let ccall_result = match env::promise_result(0) {
-            PromiseResult::Successful(data) => String::from_utf8_lossy(&data).to_string(),
+        // Read batch results from yield_resume payload
+        // auto_resume_batch_ccall borsh-serializes Vec<Vec<u8>>
+        let ccall_results: Vec<Vec<u8>> = match env::promise_result(0) {
+            PromiseResult::Successful(data) => {
+                borsh::from_slice(&data)
+                    .unwrap_or_else(|e| panic!("Failed to deserialize batch results: {}", e))
+            }
             PromiseResult::Failed => {
                 env::storage_remove(yield_id.as_bytes());
-                return "ERROR: ccall failed".to_string();
+                return "ERROR: ccall batch failed".to_string();
             }
         };
 
-        // Inject result into environment
+        // Inject all results into environment
         let mut eval_env = state.env;
-        if let Some(var) = &state.pending_var.clone() {
-            // (define var (near/ccall ...)) → inject result as the variable
-            eval_env.push((var.clone(), LispVal::Str(ccall_result.clone())));
-        } else {
-            // standalone (near/ccall ...) → inject as __ccall_result__
-            eval_env.push((
-                "__ccall_result__".to_string(),
-                LispVal::Str(ccall_result.clone()),
-            ));
-        }
 
-        // Append result to accumulated __ccall_results__ list (for near/batch-result)
-        {
-            let results_entry = eval_env
-                .iter_mut()
-                .rev()
-                .find(|(k, _)| k == "__ccall_results__");
-            match results_entry {
-                Some((_, LispVal::List(ref mut vals))) => {
-                    vals.push(LispVal::Str(ccall_result));
-                }
-                _ => {
-                    // First result — create the list
-                    eval_env.push((
-                        "__ccall_results__".to_string(),
-                        LispVal::List(vec![LispVal::Str(ccall_result)]),
-                    ));
+        for (i, result_bytes) in ccall_results.iter().enumerate() {
+            let pending_var = state.pending_vars.get(i);
+
+            let raw = String::from_utf8_lossy(result_bytes).to_string();
+            let ccall_result_val = serde_json::from_str::<serde_json::Value>(&raw)
+                .map(json_to_lisp)
+                .unwrap_or(LispVal::Str(raw));
+
+            if let Some(Some(var)) = pending_var {
+                // (define var (near/ccall ...)) → inject result as the variable
+                eval_env.push((var.clone(), ccall_result_val.clone()));
+            } else {
+                // standalone (near/ccall ...) → inject as __ccall_result__
+                eval_env.push(("__ccall_result__".to_string(), ccall_result_val.clone()));
+            }
+
+            // Append result to accumulated __ccall_results__ list (for near/batch-result)
+            {
+                let results_entry = eval_env
+                    .iter_mut()
+                    .rev()
+                    .find(|(k, _)| k == "__ccall_results__");
+                match results_entry {
+                    Some((_, LispVal::List(ref mut vals))) => {
+                        vals.push(ccall_result_val.clone());
+                    }
+                    _ => {
+                        eval_env.push((
+                            "__ccall_results__".to_string(),
+                            LispVal::List(vec![ccall_result_val.clone()]),
+                        ));
+                    }
                 }
             }
         }
 
-        // Cleanup stored state (will be re-saved if we yield again)
+        // Cleanup stored state
         env::storage_remove(yield_id.as_bytes());
 
         // Continue evaluating remaining expressions using ccall-aware runner
         let mut gas = state.gas;
         match run_remaining_with_ccall(&state.remaining, &mut eval_env, &mut gas) {
             Ok(RunResult::Done(result)) => result,
-            Ok(RunResult::Yield(yi)) => {
-                // Re-yield: another ccall found in remaining expressions.
-                // Set up a new yield+ccall chain.
-                Self::setup_yield_chain(yi)
+            Ok(RunResult::Yield { yields, state }) => {
+                // More ccalls found — set up another batch yield chain
+                Self::setup_batch_yield_chain(yields, state)
             }
             Err(e) => format!("ERROR: {}", e),
         }
     }
 
-    /// Auto-resume callback — called when the cross-contract promise completes.
+    /// Auto-resume callback — called when ALL parallel cross-contract promises complete.
     ///
-    /// Reads the cross-contract result from `promise_result(0)` and passes it
-    /// to `promise_yield_resume` to wake up the deferred `resume_eval` receipt.
-    pub fn auto_resume_ccall(&mut self, data_id_hex: String) {
+    /// Reads all N promise results, borsh-serializes them into Vec<Vec<u8>>,
+    /// and passes them to `promise_yield_resume` to wake up the deferred
+    /// `resume_eval` receipt with all results at once.
+    pub fn auto_resume_batch_ccall(&mut self, data_id_hex: String) {
         // Guard: must be called as cross-contract callback
-        assert!(
-            env::promise_results_count() > 0,
-            "auto_resume_ccall: must be called as callback"
-        );
+        let count = env::promise_results_count();
+        assert!(count > 0, "auto_resume_batch_ccall: must be called as callback");
 
         let data_id_bytes = hex_decode(&data_id_hex);
         let data_id: CryptoHash = data_id_bytes.try_into().expect("data_id must be 32 bytes");
 
-        // Read the cross-contract call result
-        let result = match env::promise_result(0) {
-            PromiseResult::Successful(data) => data,
-            PromiseResult::Failed => vec![],
-        };
+        // Collect ALL promise results
+        let mut results: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            match env::promise_result(i) {
+                PromiseResult::Successful(data) => results.push(data),
+                PromiseResult::Failed => results.push(vec![]),
+            }
+        }
 
-        // Resume the yield, passing the result as payload
-        env::promise_yield_resume(&data_id, &result);
+        // Borsh-serialize the results and resume the yield
+        let payload = borsh::to_vec(&results).expect("Failed to serialize batch results");
+        env::promise_yield_resume(&data_id, &payload);
     }
 
     // -----------------------------------------------------------------------
@@ -2193,49 +2526,102 @@ impl LispContract {
 
     /// Set up a yield + cross-contract call + auto-resume callback chain.
     /// Used by both `eval_async` (first yield) and `resume_eval` (re-yield).
-    fn setup_yield_chain(yi: CcallYield) -> String {
+    /// Set up a batch yield + parallel cross-contract calls + auto-resume callback chain.
+    ///
+    /// Creates ONE yield, N parallel cross-contract promises combined via Promise::all(),
+    /// and ONE auto_resume_batch_ccall callback that collects all N results.
+    /// This uses a single yield cycle regardless of how many ccalls are batched,
+    /// saving ~66T per additional ccall vs the old sequential approach.
+    fn setup_batch_yield_chain(yields: Vec<CcallYield>, state: VmState) -> String {
+        let n = yields.len();
+        assert!(n > 0, "setup_batch_yield_chain: empty yields");
+
         // Save VM state to contract storage
         let yield_id = format!("vm:{}:{}", env::block_height(), env::block_timestamp());
-        let state_bytes = borsh::to_vec(&yi.state).expect("VmState serialization failed");
+        let state_bytes = borsh::to_vec(&state).expect("VmState serialization failed");
         env::storage_write(yield_id.as_bytes(), &state_bytes);
 
+        // Dynamic gas budget:
+        //   remaining = prepaid - used
+        //   yield_overhead = 40T (constant, consumed by promise_yield_create)
+        //   total_ccall_gas = sum of each ccall's gas_tgas
+        //   auto_resume_gas = 5T for the single callback
+        //   reserve = 10T for current fn overhead
+        //   resume_effective = remaining - yield_overhead - total_ccall - auto_resume - reserve
+        let prepaid = env::prepaid_gas().as_gas();
+        let used = env::used_gas().as_gas();
+        let remaining = prepaid.saturating_sub(used);
+        let auto_resume_gas = Gas::from_tgas(5);
+        let reserve_gas: u64 = 10_000_000_000_000; // 10 Tgas
+        let yield_overhead: u64 = 40_000_000_000_000; // 40 Tgas
+
+        let total_ccall_gas: u64 = yields
+            .iter()
+            .map(|y| y.gas_tgas * 1_000_000_000_000)
+            .sum();
+
+        let resume_effective = remaining
+            .saturating_sub(yield_overhead)
+            .saturating_sub(total_ccall_gas)
+            .saturating_sub(auto_resume_gas.as_gas())
+            .saturating_sub(reserve_gas);
+
+        let resume_gas = Gas::from_gas(resume_effective.saturating_add(yield_overhead));
+
         // Step 1: Create yield — stores data_id in register 0
+        let yield_args = serde_json::json!({"yield_id": &yield_id}).to_string();
         env::promise_yield_create(
             "resume_eval",
-            yield_id.as_bytes(),
-            Gas::from_tgas(200),
+            yield_args.as_bytes(),
+            resume_gas,
             GasWeight(0),
             0,
         );
 
-        // Read data_id from register
         let data_id = env::read_register(0).expect("promise_yield_create should write data_id");
         let data_id_hex = hex_encode(&data_id);
 
-        // Step 2: Create cross-contract call promise
-        let account_id: near_sdk::AccountId = yi
-            .account
-            .parse()
-            .expect("invalid account id in near/ccall");
+        // Step 2: Create N parallel cross-contract call promises
+        let self_id = env::current_account_id();
 
-        // Step 3: Chain callback
-        let auto_args = serde_json::json!({
-            "data_id_hex": data_id_hex
-        })
-        .to_string();
+        let mut promises: Vec<Promise> = Vec::with_capacity(n);
+        for yi in &yields {
+            let account_id: near_sdk::AccountId = yi
+                .account
+                .parse()
+                .expect("invalid account id in near/ccall");
+            let cc_gas = Gas::from_tgas(yi.gas_tgas);
+            let p = Promise::new(account_id).function_call(
+                yi.method.clone(),
+                yi.args_bytes.clone(),
+                NearToken::from_yoctonear(yi.deposit),
+                cc_gas,
+            );
+            promises.push(p);
+        }
 
-        let cc_promise = Promise::new(account_id).function_call(
-            yi.method,
-            yi.args_bytes,
-            NearToken::from_yoctonear(yi.deposit),
-            Gas::from_tgas(yi.gas_tgas),
-        );
+        // Step 3: Combine all promises into one, then chain single callback
+        let auto_args = serde_json::json!({"data_id_hex": data_id_hex}).to_string();
 
-        let _ = cc_promise.then(Promise::new(env::current_account_id()).function_call(
-            "auto_resume_ccall".to_string(),
+        let combined = if promises.len() == 1 {
+            promises.into_iter().next().unwrap()
+        } else {
+            // Use Promise::and to combine all N promises
+            let mut iter = promises.into_iter();
+            let first = iter.next().unwrap();
+            let second = iter.next().unwrap();
+            let mut combined = first.and(second);
+            for p in iter {
+                combined = combined.and(p);
+            }
+            combined
+        };
+
+        let _ = combined.then(Promise::new(self_id).function_call(
+            "auto_resume_batch_ccall".to_string(),
             auto_args.into_bytes(),
             NearToken::from_yoctonear(0),
-            Gas::from_tgas(50),
+            auto_resume_gas,
         ));
 
         "YIELDING".to_string()

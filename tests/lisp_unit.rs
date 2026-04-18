@@ -1,5 +1,4 @@
 use near_lisp::*;
-use std::rc::Rc;
 
 fn eval_str(code: &str) -> String {
     let mut env = Vec::new();
@@ -296,7 +295,7 @@ fn test_vmstate_complex_env() {
                         ]),
                     ]),
                 ])),
-                closed_env: Rc::new(vec![]),
+                closed_env: Box::new(vec![]),
             },
         )],
         gas: 50000,
