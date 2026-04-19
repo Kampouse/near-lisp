@@ -400,8 +400,8 @@ fn as_str(v: &LispVal) -> Result<String, String> {
 }
 
 /// Prepend the storage sandbox prefix from the env (if any).
-/// If `__storage_prefix__` is set in env, keys become `{prefix}{key}`.
-/// Otherwise, the raw key is used as-is (backward compatible).
+/// Uses a fast reverse scan — `__storage_prefix__` is typically near the end
+/// (pushed early at setup), so `.rev().find()` is usually O(1).
 fn sandbox_key(raw_key: &str, env: &[(String, LispVal)]) -> String {
     env.iter()
         .rev()
@@ -720,20 +720,24 @@ pub fn lisp_eval(
                             Some(LispVal::List(b)) => b,
                             _ => return Err("let: bindings must be list".into()),
                         };
-                        let mut local = env.clone();
+                        let base_len = env.len();
                         for b in bindings {
                             if let LispVal::List(pair) = b {
                                 if pair.len() == 2 {
                                     if let LispVal::Sym(name) = &pair[0] {
-                                        let val = lisp_eval(&pair[1], &mut local, gas)?;
-                                        local.push((name.clone(), val));
+                                        let val = lisp_eval(&pair[1], env, gas)?;
+                                        env.push((name.clone(), val));
                                     }
                                 }
                             }
                         }
-                        list.get(2)
-                            .map(|e| lisp_eval(e, &mut local, gas))
-                            .unwrap_or(Ok(LispVal::Nil))
+                        let result = list
+                            .get(2)
+                            .map(|e| lisp_eval(e, env, gas))
+                            .unwrap_or(Ok(LispVal::Nil));
+                        // Pop let bindings
+                        env.truncate(base_len);
+                        result
                     }
                     "lambda" => {
                         let (params, rest_param) = parse_params(list.get(1).ok_or("lambda: need params")?)?;
@@ -795,13 +799,14 @@ pub fn lisp_eval(
                                         Some(LispVal::Sym(s)) => s.clone(),
                                         _ => return Err("try: catch needs a variable name".into()),
                                     };
-                                    let mut local = env.clone();
-                                    local.push((error_var, LispVal::Str(err_msg)));
-                                    // Evaluate handler body forms (progn-style)
+                                    // Push error binding, eval handler, then pop
+                                    env.push((error_var, LispVal::Str(err_msg)));
                                     let mut r = LispVal::Nil;
+                                    let base_len = env.len() - 1;
                                     for body_expr in &clause[2..] {
-                                        r = lisp_eval(body_expr, &mut local, gas)?;
+                                        r = lisp_eval(body_expr, env, gas)?;
                                     }
+                                    env.truncate(base_len);
                                     Ok(r)
                                 } else {
                                     Err("try: catch clause must be a list".into())
@@ -816,14 +821,16 @@ pub fn lisp_eval(
                             if let LispVal::List(parts) = clause {
                                 if parts.len() >= 2 {
                                     if let Some(bindings) = match_pattern(&parts[0], &val) {
-                                        let mut local = env.clone();
+                                        let base_len = env.len();
                                         for (name, v) in bindings {
-                                            local.push((name, v));
+                                            env.push((name, v));
                                         }
-                                        return parts
+                                        let result = parts
                                             .get(1)
-                                            .map(|e| lisp_eval(e, &mut local, gas))
+                                            .map(|e| lisp_eval(e, env, gas))
                                             .unwrap_or(Ok(LispVal::Nil));
+                                        env.truncate(base_len);
+                                        return result;
                                     }
                                 }
                             }
@@ -870,11 +877,16 @@ pub fn lisp_eval(
                             }
                         }
                         loop {
-                            let mut local = env.clone();
+                            // Push bindings into env — no clone needed.
+                            // On recur, we'll pop them and push fresh values.
+                            let base_len = env.len();
                             for (i, name) in binding_names.iter().enumerate() {
-                                local.push((name.clone(), binding_vals[i].clone()));
+                                env.push((name.clone(), binding_vals[i].clone()));
                             }
-                            match lisp_eval(body, &mut local, gas)? {
+                            let result = lisp_eval(body, env, gas);
+                            // Pop the bindings we just pushed
+                            env.truncate(base_len);
+                            match result? {
                                 LispVal::Recur(new_vals) => {
                                     if new_vals.len() != binding_names.len() {
                                         return Err(format!(
@@ -2088,6 +2100,7 @@ pub fn run_program_with_ccall(
     let mut gas = gas_limit;
 
     let mut pos = 0;
+    let mut last_result = LispVal::Nil;
 
     while pos < exprs.len() {
         // Phase 1: Evaluate all non-ccall expressions at the front
@@ -2095,11 +2108,11 @@ pub fn run_program_with_ccall(
             if check_ccall(&exprs[pos], env, &mut gas)?.is_some() {
                 break; // hit a ccall — stop evaluating
             }
-            lisp_eval(&exprs[pos], env, &mut gas)?;
+            last_result = lisp_eval(&exprs[pos], env, &mut gas)?;
             pos += 1;
         }
 
-        // Phase 2: Batch-scan consecutive ccalls
+        // Phase 2: Batch-scan consecutive ccalls (single pass, no env clone)
         let mut batch = Vec::new();
         let mut first_after_batch = pos;
 
@@ -2128,17 +2141,11 @@ pub fn run_program_with_ccall(
             })
             .collect();
 
-        // Extract pending_vars (second scan with cloned env)
-        let mut pending_vars = Vec::new();
-        let mut gas2 = gas_limit;
-        let mut env2 = env.clone();
-        for i in pos..first_after_batch {
-            if let Some(ccall_info) = check_ccall(&exprs[i], &mut env2, &mut gas2)? {
-                pending_vars.push(ccall_info.pending_var);
-            }
-        }
-        *env = env2;
-        gas = gas2;
+        // Extract pending_vars from the already-collected batch (no second scan)
+        let pending_vars: Vec<Option<String>> = batch
+            .iter()
+            .map(|info| info.pending_var.clone())
+            .collect();
 
         let remaining = exprs[first_after_batch..].to_vec();
 
@@ -2153,17 +2160,8 @@ pub fn run_program_with_ccall(
         });
     }
 
-    // All expressions evaluated — return last result
-    // Re-evaluate to get the final value since the loop consumed them.
-    let mut result = LispVal::Nil;
-    let mut final_env = env.clone();
-    let mut final_gas = gas_limit;
-    for expr in exprs.iter() {
-        result = lisp_eval(expr, &mut final_env, &mut final_gas)?;
-    }
-    *env = final_env;
-    gas = final_gas;
-    Ok(RunResult::Done(result.to_string()))
+    // All expressions evaluated — return tracked last result (no re-evaluation)
+    Ok(RunResult::Done(last_result.to_string()))
 }
 
 /// Run a list of already-parsed expressions that may contain cross-contract calls.
@@ -2178,6 +2176,7 @@ pub fn run_remaining_with_ccall(
     gas: &mut u64,
 ) -> Result<RunResult, String> {
     let mut pos = 0;
+    let mut last_result = LispVal::Nil;
 
     while pos < exprs.len() {
         // Phase 1: Evaluate all non-ccall expressions at the front
@@ -2185,11 +2184,11 @@ pub fn run_remaining_with_ccall(
             if check_ccall(&exprs[pos], env, gas)?.is_some() {
                 break; // hit a ccall — stop evaluating
             }
-            lisp_eval(&exprs[pos], env, gas)?;
+            last_result = lisp_eval(&exprs[pos], env, gas)?;
             pos += 1;
         }
 
-        // Phase 2: Batch-scan consecutive ccalls
+        // Phase 2: Batch-scan consecutive ccalls (single pass, no env clone)
         let mut batch = Vec::new();
         let mut first_after_batch = pos;
 
@@ -2218,17 +2217,9 @@ pub fn run_remaining_with_ccall(
             })
             .collect();
 
-        // Extract pending_vars (second scan with cloned env)
-        let mut pending_vars = Vec::new();
-        let mut gas2 = *gas;
-        let mut env2 = env.clone();
-        for i in pos..first_after_batch {
-            if let Some(ccall_info) = check_ccall(&exprs[i], &mut env2, &mut gas2)? {
-                pending_vars.push(ccall_info.pending_var);
-            }
-        }
-        *env = env2;
-        *gas = gas2;
+        // Extract pending_vars from the already-collected batch (no second scan)
+        let pending_vars: Vec<Option<String>> =
+            batch.iter().map(|info| info.pending_var.clone()).collect();
 
         let remaining = exprs[first_after_batch..].to_vec();
 
@@ -2245,19 +2236,8 @@ pub fn run_remaining_with_ccall(
         });
     }
 
-    // All expressions evaluated — return the result of the last one
-    // The while loop above consumed them via lisp_eval, so we need
-    // to track the last result. Re-evaluate is simpler and gas-cheap
-    // since non-ccall expressions are tiny.
-    let mut result = LispVal::Nil;
-    let mut final_env = env.clone();
-    let mut final_gas = *gas;
-    for expr in exprs.iter() {
-        result = lisp_eval(expr, &mut final_env, &mut final_gas)?;
-    }
-    *env = final_env;
-    *gas = final_gas;
-    Ok(RunResult::Done(result.to_string()))
+    // All expressions evaluated — return tracked last result (no re-evaluation)
+    Ok(RunResult::Done(last_result.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2265,7 +2245,13 @@ pub fn run_remaining_with_ccall(
 // ---------------------------------------------------------------------------
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX_CHARS[(b >> 4) as usize] as char);
+        s.push(HEX_CHARS[(b & 0xf) as usize] as char);
+    }
+    s
 }
 
 fn hex_decode(hex: &str) -> Vec<u8> {
@@ -2406,7 +2392,11 @@ impl LispContract {
             "Only owner can save policies"
         );
         env::storage_write(format!("policy:{}", name).as_bytes(), policy.as_bytes());
-        self.policy_names.insert(name);
+        self.policy_names.insert(name.clone());
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"save_policy\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     pub fn eval_policy(&self, name: String, input_json: String) -> String {
@@ -2459,7 +2449,11 @@ impl LispContract {
             Err(e) => panic!("Script parse error: {}", e),
         }
         env::storage_write(format!("script:{}", name).as_bytes(), code.as_bytes());
-        self.script_names.insert(name);
+        self.script_names.insert(name.clone());
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"save_script\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     /// View: get a stored script by name
@@ -2482,6 +2476,10 @@ impl LispContract {
         );
         env::storage_remove(format!("script:{}", name).as_bytes());
         self.script_names.remove(&name);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"remove_script\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     // --- Custom module management ---
@@ -2499,7 +2497,11 @@ impl LispContract {
             Err(e) => panic!("Module parse error: {}", e),
         }
         env::storage_write(format!("module:{}", name).as_bytes(), code.as_bytes());
-        self.module_names.insert(name);
+        self.module_names.insert(name.clone());
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"save_module\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     /// View: get a stored module by name
@@ -2522,6 +2524,10 @@ impl LispContract {
         );
         env::storage_remove(format!("module:{}", name).as_bytes());
         self.module_names.remove(&name);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"remove_module\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     /// Delete a stored policy (owner-only)
@@ -2533,6 +2539,10 @@ impl LispContract {
         );
         env::storage_remove(format!("policy:{}", name).as_bytes());
         self.policy_names.remove(&name);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"remove_policy\",\"data\":{{\"name\":\"{}\"}}}}",
+            name
+        ));
     }
 
     /// Evaluate a stored script synchronously (no ccall support)
@@ -2587,9 +2597,10 @@ impl LispContract {
             self.owner,
             "Only owner can transfer ownership"
         );
+        let old_owner = self.owner.clone();
         env::log_str(&format!(
-            "Ownership transferred from {} to {}",
-            self.owner, new_owner
+            "EVENT_JSON:{{\"standard\":\"near-lisp\",\"version\":\"1.0.0\",\"event\":\"transfer_ownership\",\"data\":{{\"old_owner\":\"{}\",\"new_owner\":\"{}\"}}}}",
+            old_owner, new_owner
         ));
         self.owner = new_owner;
     }

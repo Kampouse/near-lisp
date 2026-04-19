@@ -3066,3 +3066,70 @@ fn test_inspect_lambda() {
     assert!(result.contains("lambda"), "inspect lambda: {}", result);
     assert!(result.contains("2"), "should show param count: {}", result);
 }
+
+// --- Defmacro tests ---
+
+#[test]
+fn test_defmacro_basic() {
+    // (defmacro double (x) (list * x 2))
+    // (double 5) → (* 5 2) → 10
+    let code = r#"
+        (defmacro double (x) (list * x 2))
+        (double 5)
+    "#;
+    assert_eq!(eval_str_gas(code, 100_000), "10");
+}
+
+#[test]
+fn test_defmacro_quasiquote() {
+    // Simple macro using quote — (when cond body) → (if cond body nil)
+    let code = r#"
+        (defmacro when (cond body) (list (quote if) cond body (quote nil)))
+        (when (> 3 1) 42)
+    "#;
+    assert_eq!(eval_str_gas(code, 100_000), "42");
+}
+
+#[test]
+fn test_defmacro_not_triggered() {
+    // Make sure defmacro returns nil and doesn't error
+    let code = "(defmacro my-mac (x) x)";
+    assert_eq!(eval_str_gas(code, 50_000), "nil");
+}
+
+#[test]
+fn test_macroexpand() {
+    // macroexpand should return the expanded form without evaluating
+    let code = r#"
+        (defmacro double (x) (list * x 2))
+        (macroexpand (double 5))
+    "#;
+    let result = eval_str_gas(code, 100_000);
+    assert!(
+        result.contains("*"),
+        "expanded should contain *: {}",
+        result
+    );
+    assert!(
+        result.contains("5"),
+        "expanded should contain 5: {}",
+        result
+    );
+}
+
+#[test]
+fn test_type_macro() {
+    let result = eval_str_gas("(type? (defmacro m (x) x))", 50_000);
+    // defmacro returns nil, type? of nil
+    assert_eq!(result, "\"nil\"");
+}
+
+#[test]
+fn test_defmacro_rest_param() {
+    // Macro with &rest — collects all args as list
+    let code = r#"
+        (defmacro my-list (&rest args) (cons (quote list) args))
+        (my-list 1 2 3)
+    "#;
+    assert_eq!(eval_str_gas(code, 100_000), "(1 2 3)");
+}
