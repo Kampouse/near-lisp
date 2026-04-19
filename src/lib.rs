@@ -875,6 +875,41 @@ impl LoopCompiler {
                             }
                             true
                         }
+                        // cond: multi-branch — chained JumpIfFalse
+                        // (cond (t1 r1) (t2 r2) (else rN))
+                        "cond" => {
+                            if list.len() < 2 { return false; }
+                            let mut end_jumps: Vec<usize> = Vec::new();
+                            let mut i = 1;
+                            while i < list.len() {
+                                let clause = match list.get(i) {
+                                    Some(LispVal::List(c)) if c.len() >= 2 => c.clone(),
+                                    _ => { return false; }
+                                };
+                                // else clause — just compile result
+                                if clause[0] == LispVal::Sym("else".into()) {
+                                    if !self.compile_expr(&clause[1], outer_env) { return false; }
+                                    break;
+                                }
+                                // compile test
+                                if !self.compile_expr(&clause[0], outer_env) { return false; }
+                                let jf_idx = self.code.len();
+                                self.code.push(Op::JumpIfFalse(0)); // placeholder
+                                // compile result
+                                if !self.compile_expr(&clause[1], outer_env) { return false; }
+                                end_jumps.push(self.code.len());
+                                self.code.push(Op::Jump(0)); // jump to end
+                                // patch JF to skip to next clause
+                                self.code[jf_idx] = Op::JumpIfFalse(self.code.len());
+                                i += 1;
+                            }
+                            // patch all end jumps
+                            let end_pc = self.code.len();
+                            for idx in end_jumps {
+                                self.code[idx] = Op::Jump(end_pc);
+                            }
+                            true
+                        }
                         _ => {
                             if list.len() > 1 {
                                 let n_args = list.len() - 1;
@@ -1198,6 +1233,16 @@ fn eval_builtin(name: &str, args: &[LispVal]) -> Result<LispVal, String> {
         "zero?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) == 0)),
         "pos?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) > 0)),
         "neg?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) < 0)),
+        "mod" => {
+            let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
+            if b == 0 { return Err("mod by zero".into()); }
+            Ok(LispVal::Num(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b))
+        }
+        "remainder" => {
+            let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
+            if b == 0 { return Err("remainder by zero".into()); }
+            Ok(LispVal::Num(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b))
+        }
         "even?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 == 0)),
         "odd?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 != 0)),
         _ => Err(format!("loop bytecode: unknown builtin '{}'", name)),
