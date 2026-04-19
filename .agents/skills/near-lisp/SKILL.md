@@ -366,7 +366,7 @@ Keys are prefixed with `eval:{caller_account}:` for isolation.
 #### Cross-Contract Calls (yield/resume)
 
 ```lisp
-;; View call (read-only, default 0 deposit, 50 TGas)
+;; View call (read-only, default 0 deposit, 10 TGas)
 (define price (near/ccall "oracle.near" "get_price" "{}"))
 
 ;; View call (explicit)
@@ -384,13 +384,22 @@ Keys are prefixed with `eval:{caller_account}:` for isolation.
 **How ccalls work (batched)**: When `eval_async` encounters top-level ccalls, it pre-scans ALL consecutive ccalls and batches them into ONE yield cycle. N parallel cross-contract promises are created via `Promise::and()`, combined, then chained to a single `auto_resume_batch_ccall` callback. When all promises resolve, the callback borsh-serializes `Vec<Vec<u8>>` results and calls `promise_yield_resume`, which wakes `resume_eval` to inject all N results into the environment at once, then continues evaluating remaining expressions.
 
 **Gas costs (batched, on testnet)**:
-- 1 ccall: 100T minimum
-- 2 ccalls: 152T minimum (~50T per extra ccall)
-- 3 ccalls: 203T minimum
-- Formula: ~100T base + N × ~50T per ccall
-- Each ccall defaults to 10T gas (configurable in near/ccall-call args)
+- 1 ccall: 55T minimum, ~10.4T actual burn
+- 2 ccalls: 60T minimum, ~12.3T actual burn
+- 3 ccalls: 60T minimum, ~14.3T actual burn
+- 4 ccalls: 65T minimum, ~16.4T actual burn
+- 5 ccalls: 70T minimum, ~18.5T actual burn
+- 6 ccalls: 75T minimum, ~20.6T actual burn
+- Marginal cost per extra ccall: ~2.1T actual burn
+- Each ccall defaults to 10T gas allocation (configurable in near/ccall-call args; actual burn typically ~1.4T for view calls)
+- Per-ccall promise receipt burns only ~1.4T actual — 86% waste within the 10T allocation
 
-**Key constants**: `promise_yield_create` has ~40T fixed overhead per yield cycle. Auto-resume callback uses 5T. Reserve for current fn overhead is 10T.
+**Key constants** (dynamic, optimized):
+- `yield_overhead`: 5T (reduced from original 40T → 10T → 5T)
+- `auto_resume_gas`: `2T + N × 0.1T` (scales with batch size)
+- `reserve`: `3T + 0.3T × (N-1)` (covers Promise::and() chain overhead)
+- `promise_yield_create`: ~5T fixed overhead per yield cycle
+- `ccall_gas` per view: 10T allocation (1.4T typical burn)
 
 ---
 
@@ -596,6 +605,29 @@ Empty list `()` is `LispVal::List(vec![])`, NOT `LispVal::Nil`. The `nil?` predi
 ### Key implementation detail: stdlib lambda gas cost (RESOLVED)
 Lisp-defined stdlib functions (via `require "list"`) were gas-prohibitive on-chain. Root cause: every lambda call clones the env, resolves the closure, and re-enters the full eval pipeline. **Fixed**: all list stdlib functions are now native Rust builtins in `dispatch_call`. `range`, `reverse`, `sort`, `zip`, `empty?` iterate with pure Rust loops (near-zero overhead). Higher-order functions (`map`, `filter`, `reduce`, `find`, `some`, `every`) iterate in Rust and call user lambdas via `call_val` per element — only the user lambda pays gas, the outer loop is free. Builtin names are first-class values via `is_builtin_name()` — `(reduce + 0 (list 1 2 3))` works without lambda wrapping. Env bindings shadow builtins (env checked first in `lisp_eval`).
 
+### Ccall test file migration (tests/lisp_unit.rs)
+
+The ccall batching refactor changed `VmState` and `RunResult` API. Tests in `tests/lisp_unit.rs` lines ~233-762 that directly construct `VmState` or pattern-match `RunResult::Yield` are broken and need migration:
+
+**Old → New mappings:**
+- `pending_var: Option<String>` → `pending_vars: Vec<Option<String>>`
+- `VmState { ..., pending_var: Some("price".into()) }` → `VmState { ..., pending_vars: vec![Some("price".into())] }`
+- `pending_var: None` → `pending_vars: vec![]` (for standalone ccalls with no define wrapper)
+- `RunResult::Yield(yi)` → `RunResult::Yield { yields, state }` (struct variant, not tuple)
+- `yi.account`, `yi.method` → `yields[0].account`, `yields[0].method`
+- `yi.state.pending_var` → `state.pending_vars[0]`
+- `yi.state.remaining` → `state.remaining`
+- `yi.state.env` → `state.env`
+- `yi.state.gas` → `state.gas`
+
+**Multi-ccall tests now batch**: Old tests expected two ccalls to yield separately (first yields, resume, second yields, resume). Now consecutive ccalls batch into ONE yield with `yields.len() == N`. Tests like `test_multi_ccall_two_ccalls_yield_chain` need rewriting: both ccalls appear in `yields`, both var names in `pending_vars`, resume injects all N results at once.
+
+**`test_run_program_no_ccall`**: This one is easy — `RunResult::Yield(_)` → `RunResult::Yield { .. }` (wildcard struct).
+
+**VmState roundtrip tests** (`test_vmstate_roundtrip`, `test_vmstate_complex_env`, `test_hex_roundtrip`): Change `pending_var: Some(...)` / `pending_var: None` to `pending_vars: vec![...]` / `pending_vars: vec![]`.
+
+**Tests that DON'T need migration**: All `eval_str()` / `eval_str_gas()` tests — these call `run_program()` which returns `Result<String, String>`, completely unaffected by the VmState/RunResult changes.
+
 ### Sandbox test coverage gap
 
 The example files (examples/01-19) are not integration-tested in sandbox. They run as unit tests or parse-only. The critical gap: examples 12 (near-context), 13 (modules), 14 (policies), 16 (cross-contract) are parse-only — never executed on-chain. The sandbox tests in `tests/lisp_sandbox.rs` cover individual features inline with explicit assertions, but don't load the example files.
@@ -626,7 +658,7 @@ Receipt 0 = "YIELDING", Receipt 1 = actual resume_eval result, Receipt 3 = ccall
 **Cross-contract (ccall yield/resume) in sandbox**: CONFIRMED — `promise_yield_create` does NOT execute in near-workspaces sandbox (v0.22). Calls to `eval_async` always fail at ~1.78T gas (the yield never fires). The ccall yield path can ONLY be tested on testnet. Sandbox CAN measure non-yield costs:
 - Sync eval: ~1.5T per call
 - Ccall scanning: ~0.03T per ccall scanned (negligible — the double-scan for pending_vars is not worth optimizing)
-- The ~50T per-ccall cost is ~80% NEAR runtime overhead (promise_yield_create ~40T, deferred receipt execution, promise scheduling) — NOT Lisp computation. Gas optimization should focus on reducing ccall_gas default (10T → 3-5T for views), auto_resume_gas (5T → 3T), and reserve_gas (10T → 5T). Sandbox benchmarks exist in `tests/bench_micro.rs` and `tests/bench_gas_sandbox.rs`.
+- Sandbox benchmarks exist in `tests/bench_micro.rs` and `tests/bench_gas_sandbox.rs`.
 
 ### Build pitfalls
 
@@ -671,7 +703,7 @@ Runs 129 tests against the live testnet contract. Uses `near contract call-funct
 
 **FIXED — ccall result JSON double-encoding**: `resume_eval` was injecting raw `promise_result` bytes as `LispVal::Str`, so JSON-encoded returns (e.g. `"kampy.testnet"` with quotes) became double-quoted Lisp strings. Fixed by parsing through `serde_json::from_str` → `json_to_lisp`, which unwraps JSON types into proper Lisp types (strings without quotes, numbers as Num, arrays as List, objects as Map). Falls back to raw string if JSON parse fails.
 
-**FIXED — Multi-ccall batched yield/resume (deployed)**: ccalls in `eval_async` only work at the TOP expression level or inside `(define var (near/ccall ...))`. They are pre-flight detected by `check_ccall()`, NOT handled at runtime in `dispatch_call`. Placing them inside `progn`, `let`, `if`, or any nested form results in `"undefined: near/ccall-view"`. Multiple consecutive top-level ccalls are now batched into a single yield cycle via `Promise::and()` — all N ccalls run in parallel, one callback collects all results. Gas: 100T base + ~50T per extra ccall. 2 ccalls = 152T, 3 ccalls = 203T. All 21 on-chain tests pass.
+**FIXED — Multi-ccall batched yield/resume (deployed)**: ccalls in `eval_async` only work at the TOP expression level or inside `(define var (near/ccall ...))`. They are pre-flight detected by `check_ccall()`, NOT handled at runtime in `dispatch_call`. Placing them inside `progn`, `let`, `if`, or any nested form results in `"undefined: near/ccall-view"`. Multiple consecutive top-level ccalls are now batched into a single yield cycle via `Promise::and()` — all N ccalls run in parallel, one callback collects all results. Gas (optimized): 55T base + ~5T per extra ccall. 6 ccalls at 75T prepaid, actual burn ~20.6T. All 21 on-chain tests pass.
 
 **MEDIUM — `type?` undefined when called directly**: `type?` is listed in `is_builtin_name()` (for first-class value support) but has NO handler in the `dispatch_call()` match arms. Calling `(type? 42)` goes through the dispatch fallback which looks up in env → fails → "undefined: type?". Fix: add `"type?"` to the `dispatch_call` match alongside other type predicates (`nil?`, `list?`, `number?`, `string?`, `map?`).
 

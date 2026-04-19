@@ -337,6 +337,7 @@ fn is_builtin_name(name: &str) -> bool {
             | "number?"
             | "string?"
             | "map?"
+            | "bool?"
             | "to-float"
             | "to-int"
             | "to-num"
@@ -1142,6 +1143,39 @@ fn dispatch_call(
                     .map_err(|_| format!("to-int: cannot parse '{}'", s)),
                 other => Err(format!("to-int: expected number, got {}", other)),
             },
+            "to-num" => match &args[0] {
+                // Alias for to-int — converts to i64
+                LispVal::Num(n) => Ok(LispVal::Num(*n)),
+                LispVal::Float(f) => Ok(LispVal::Num(*f as i64)),
+                LispVal::Str(s) => s
+                    .parse::<i64>()
+                    .map(LispVal::Num)
+                    .map_err(|_| format!("to-num: cannot parse '{}'", s)),
+                other => Err(format!("to-num: expected number, got {}", other)),
+            },
+            "type?" => Ok(LispVal::Str(
+                match &args[0] {
+                    LispVal::Nil => "nil",
+                    LispVal::Bool(_) => "boolean",
+                    LispVal::Num(_) => "number",
+                    LispVal::Float(_) => "number",
+                    LispVal::Str(_) => "string",
+                    LispVal::List(_) => "list",
+                    LispVal::Map(_) => "map",
+                    LispVal::Lambda { .. } => "lambda",
+                    LispVal::Sym(_) => "symbol",
+                    _ => "unknown",
+                }
+                .to_string(),
+            )),
+            "bool?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Bool(_)))),
+            "error" => {
+                let msg = args
+                    .get(0)
+                    .map(|v| format!("{}", v))
+                    .unwrap_or_else(|| "error".to_string());
+                Err(msg)
+            }
             "string?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Str(_)))),
             "map?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Map(_)))),
 
@@ -1825,7 +1859,20 @@ fn extract_ccall_info(
         };
 
         let (deposit, gas_tgas) = match mode {
-            CcallMode::View => (0u128, 10u64),
+            CcallMode::View => {
+                // Optional 4th arg: gas in Tgas. Default 10T.
+                // 10T covers most view calls (get_owner burns 1.4T).
+                // Users can override for heavy targets or to fit more ccalls in a batch.
+                let gas = inner
+                    .get(4)
+                    .map(|a| as_str(a))
+                    .transpose()?
+                    .map(|s| s.parse::<u64>())
+                    .transpose()
+                    .map_err(|_| "near/ccall: invalid gas (must be number in Tgas)".to_string())?
+                    .unwrap_or(10);
+                (0u128, gas)
+            }
             CcallMode::Call => {
                 let deposit_str =
                     inner
@@ -1897,9 +1944,8 @@ fn check_ccall(
 
 /// Run a program that may contain cross-contract calls.
 ///
-/// Scans ALL top-level expressions upfront and batches consecutive ccalls
-/// into a single yield cycle. Returns `RunResult::Yield(Vec<CcallYield>)`
-/// with all ccalls found before the first non-ccall expression.
+/// Loops: evaluates non-ccall expressions, then batch-scans for consecutive ccalls,
+/// and yields if found. Repeats until all expressions are consumed.
 pub fn run_program_with_ccall(
     code: &str,
     env: &mut Vec<(String, LispVal)>,
@@ -1907,52 +1953,66 @@ pub fn run_program_with_ccall(
 ) -> Result<RunResult, String> {
     let exprs = parse_all(code)?;
     let mut gas = gas_limit;
-    let mut result = LispVal::Nil;
 
-    // Collect all consecutive ccalls from the top
-    let mut batch = Vec::new();
-    let mut first_non_ccall = 0;
+    let mut pos = 0;
 
-    for (i, expr) in exprs.iter().enumerate() {
-        if let Some(ccall_info) = check_ccall(expr, env, &mut gas)? {
-            batch.push(ccall_info);
-            first_non_ccall = i + 1;
-        } else {
+    while pos < exprs.len() {
+        // Phase 1: Evaluate all non-ccall expressions at the front
+        while pos < exprs.len() {
+            if check_ccall(&exprs[pos], env, &mut gas)?.is_some() {
+                break; // hit a ccall — stop evaluating
+            }
+            lisp_eval(&exprs[pos], env, &mut gas)?;
+            pos += 1;
+        }
+
+        // Phase 2: Batch-scan consecutive ccalls
+        let mut batch = Vec::new();
+        let mut first_after_batch = pos;
+
+        while first_after_batch < exprs.len() {
+            if let Some(ccall_info) = check_ccall(&exprs[first_after_batch], env, &mut gas)? {
+                batch.push(ccall_info);
+                first_after_batch += 1;
+            } else {
+                break;
+            }
+        }
+
+        if batch.is_empty() {
+            // No ccalls found, all done
             break;
         }
-    }
 
-    if !batch.is_empty() {
         let yields: Vec<CcallYield> = batch
-            .into_iter()
+            .iter()
             .map(|info| CcallYield {
-                account: info.account,
-                method: info.method,
-                args_bytes: info.args_bytes,
+                account: info.account.clone(),
+                method: info.method.clone(),
+                args_bytes: info.args_bytes.clone(),
                 deposit: info.deposit,
                 gas_tgas: info.gas_tgas,
             })
             .collect();
 
-        // Extract pending_vars from check_ccall results
+        // Extract pending_vars (second scan with cloned env)
         let mut pending_vars = Vec::new();
         let mut gas2 = gas_limit;
         let mut env2 = env.clone();
-        for (i, expr) in exprs.iter().enumerate() {
-            if i >= first_non_ccall {
-                break;
-            }
-            if let Some(ccall_info) = check_ccall(expr, &mut env2, &mut gas2)? {
+        for i in pos..first_after_batch {
+            if let Some(ccall_info) = check_ccall(&exprs[i], &mut env2, &mut gas2)? {
                 pending_vars.push(ccall_info.pending_var);
             }
         }
         *env = env2;
         gas = gas2;
 
+        let remaining = exprs[first_after_batch..].to_vec();
+
         return Ok(RunResult::Yield {
             yields,
             state: VmState {
-                remaining: exprs[first_non_ccall..].to_vec(),
+                remaining,
                 env: env.clone(),
                 gas,
                 pending_vars,
@@ -1960,68 +2020,91 @@ pub fn run_program_with_ccall(
         });
     }
 
-    // No ccalls — evaluate normally
+    // All expressions evaluated — return last result
+    // Re-evaluate to get the final value since the loop consumed them.
+    let mut result = LispVal::Nil;
+    let mut final_env = env.clone();
+    let mut final_gas = gas_limit;
     for expr in exprs.iter() {
-        result = lisp_eval(expr, env, &mut gas)?;
+        result = lisp_eval(expr, &mut final_env, &mut final_gas)?;
     }
-
+    *env = final_env;
+    gas = final_gas;
     Ok(RunResult::Done(result.to_string()))
 }
 
 /// Run a list of already-parsed expressions that may contain cross-contract calls.
 /// Like `run_program_with_ccall` but takes pre-parsed `Vec<LispVal>` instead of code string.
 /// Used by `resume_eval` to continue evaluating remaining expressions after a yield.
+///
+/// Loops: evaluates non-ccall expressions, then batch-scans for consecutive ccalls,
+/// and yields if found. Repeats until all expressions are consumed.
 pub fn run_remaining_with_ccall(
     exprs: &[LispVal],
     env: &mut Vec<(String, LispVal)>,
     gas: &mut u64,
 ) -> Result<RunResult, String> {
-    let mut result = LispVal::Nil;
+    let mut pos = 0;
 
-    // Collect all consecutive ccalls from the top
-    let mut batch = Vec::new();
-    let mut first_non_ccall = 0;
+    while pos < exprs.len() {
+        // Phase 1: Evaluate all non-ccall expressions at the front
+        while pos < exprs.len() {
+            if check_ccall(&exprs[pos], env, gas)?.is_some() {
+                break; // hit a ccall — stop evaluating
+            }
+            lisp_eval(&exprs[pos], env, gas)?;
+            pos += 1;
+        }
 
-    for (i, expr) in exprs.iter().enumerate() {
-        if let Some(ccall_info) = check_ccall(expr, env, gas)? {
-            batch.push(ccall_info);
-            first_non_ccall = i + 1;
-        } else {
+        // Phase 2: Batch-scan consecutive ccalls
+        let mut batch = Vec::new();
+        let mut first_after_batch = pos;
+
+        while first_after_batch < exprs.len() {
+            if let Some(ccall_info) = check_ccall(&exprs[first_after_batch], env, gas)? {
+                batch.push(ccall_info);
+                first_after_batch += 1;
+            } else {
+                break;
+            }
+        }
+
+        if batch.is_empty() {
+            // No ccalls found, all done
             break;
         }
-    }
 
-    if !batch.is_empty() {
         let yields: Vec<CcallYield> = batch
-            .into_iter()
+            .iter()
             .map(|info| CcallYield {
-                account: info.account,
-                method: info.method,
-                args_bytes: info.args_bytes,
+                account: info.account.clone(),
+                method: info.method.clone(),
+                args_bytes: info.args_bytes.clone(),
                 deposit: info.deposit,
                 gas_tgas: info.gas_tgas,
             })
             .collect();
 
-        // Extract pending_vars from check_ccall results
+        // Extract pending_vars (second scan with cloned env)
         let mut pending_vars = Vec::new();
         let mut gas2 = *gas;
         let mut env2 = env.clone();
-        for (i, expr) in exprs.iter().enumerate() {
-            if i >= first_non_ccall {
-                break;
-            }
-            if let Some(ccall_info) = check_ccall(expr, &mut env2, &mut gas2)? {
+        for i in pos..first_after_batch {
+            if let Some(ccall_info) = check_ccall(&exprs[i], &mut env2, &mut gas2)? {
                 pending_vars.push(ccall_info.pending_var);
             }
         }
         *env = env2;
         *gas = gas2;
 
+        let remaining = exprs[first_after_batch..].to_vec();
+
+        // If there are more expressions after this batch, yield to process them later.
+        // If nothing remains, we still need to yield to execute the ccalls.
         return Ok(RunResult::Yield {
             yields,
             state: VmState {
-                remaining: exprs[first_non_ccall..].to_vec(),
+                remaining,
                 env: env.clone(),
                 gas: *gas,
                 pending_vars,
@@ -2029,11 +2112,18 @@ pub fn run_remaining_with_ccall(
         });
     }
 
-    // No ccalls — evaluate normally
+    // All expressions evaluated — return the result of the last one
+    // The while loop above consumed them via lisp_eval, so we need
+    // to track the last result. Re-evaluate is simpler and gas-cheap
+    // since non-ccall expressions are tiny.
+    let mut result = LispVal::Nil;
+    let mut final_env = env.clone();
+    let mut final_gas = *gas;
     for expr in exprs.iter() {
-        result = lisp_eval(expr, env, gas)?;
+        result = lisp_eval(expr, &mut final_env, &mut final_gas)?;
     }
-
+    *env = final_env;
+    *gas = final_gas;
     Ok(RunResult::Done(result.to_string()))
 }
 
@@ -2548,9 +2638,67 @@ impl LispContract {
         let remaining = prepaid.saturating_sub(used);
 
         let total_ccall_gas: u64 = yields.iter().map(|y| y.gas_tgas * 1_000_000_000_000).sum();
-        let auto_resume_gas = Gas::from_tgas(3);
-        let yield_overhead: u64 = 40_000_000_000_000; // 40 Tgas
-        let reserve: u64 = 10_000_000_000_000; // 10 Tgas
+        // auto_resume_batch_ccall iterates N promise results + borsh-serializes them
+        // Base: ~2T, per-result: ~0.1T (promise_result read + push)
+        let auto_resume_gas = Gas::from_tgas(2 + (n as u64 * 100_000_000_000 / 1_000_000_000_000).max(1));
+        let yield_overhead: u64 = 5_000_000_000_000; // 5 Tgas (reduced from 40T→10T→5T)
+        // Dynamic reserve: accounts for Promise::and() chain overhead (~0.25T per .and() call)
+        // N promises → N-1 .and() calls + .then() callback (~0.3T) + misc overhead (~2T)
+        let reserve: u64 = (n as u64).saturating_sub(1)
+            .saturating_mul(300_000_000_000) // 0.3T per .and() call (measured 0.252T + margin)
+            .saturating_add(3_000_000_000_000); // 3T base overhead
+
+        // Debug: log gas values for gas optimization analysis
+        env::log_str(&format!(
+            "GAS_DEBUG: prepaid={}T used={}T remaining={}T n={} total_ccall_gas={}T",
+            prepaid / 1_000_000_000_000,
+            used / 1_000_000_000_000,
+            remaining / 1_000_000_000_000,
+            n,
+            total_ccall_gas / 1_000_000_000_000,
+        ));
+
+        // Count future yield cycles in remaining expressions to right-size resume gas.
+        // Each group of consecutive ccalls forms one yield cycle, separated by non-ccall exprs.
+        let mut in_ccall_group = false;
+        let mut future_yield_cycles: u64 = 0;
+        let mut future_ccall_count: u64 = 0;
+        for expr in state.remaining.iter() {
+            let is_ccall = check_ccall(expr, &mut Vec::new(), &mut 10000u64)
+                .map(|r| r.is_some())
+                .unwrap_or(false);
+            if is_ccall {
+                future_ccall_count += 1;
+                if !in_ccall_group {
+                    future_yield_cycles += 1;
+                    in_ccall_group = true;
+                }
+            } else {
+                in_ccall_group = false;
+            }
+        }
+
+        // Base overhead for resume: deserialize VmState + inject results + eval remaining
+        let resume_base: u64 = 5_000_000_000_000; // 5T
+        // Per-ccall overhead in resume: promise_result read + JSON parse + env injection
+        let per_ccall_resume: u64 = 500_000_000_000; // 0.5T per ccall result
+        let current_batch_cost = resume_base.saturating_add(n as u64 * per_ccall_resume);
+
+        let resume_gas_needed = if future_yield_cycles > 0 {
+            // Each future yield cycle needs:
+            //   setup_batch_yield_chain overhead: 5T (yield_overhead)
+            //   auto_resume_batch_ccall: ~3T
+            //   resume_eval: ~5T
+            //   reserve: ~3T + 0.3T*(ccalls_in_batch - 1)
+            // Plus the ccall gas itself
+            let future_ccall_gas: u64 = future_ccall_count * 10_000_000_000_000; // 10T each
+            let per_cycle_overhead: u64 = 20_000_000_000_000; // 20T per yield cycle
+            current_batch_cost
+                .saturating_add(future_yield_cycles * per_cycle_overhead)
+                .saturating_add(future_ccall_gas)
+        } else {
+            current_batch_cost
+        };
 
         let resume_effective = remaining
             .saturating_sub(yield_overhead)
@@ -2558,7 +2706,26 @@ impl LispContract {
             .saturating_sub(auto_resume_gas.as_gas())
             .saturating_sub(reserve);
 
-        let resume_gas = Gas::from_gas(resume_effective.saturating_add(yield_overhead));
+        // Cap resume gas at what we actually need — don't waste the rest
+        let capped_effective = resume_effective.min(resume_gas_needed.saturating_sub(yield_overhead));
+        let resume_gas = Gas::from_gas(capped_effective.saturating_add(yield_overhead));
+
+        // Debug: log the full gas budget breakdown
+        let total_deducted_tgas = resume_gas.as_gas() / 1_000_000_000_000
+            + total_ccall_gas / 1_000_000_000_000
+            + auto_resume_gas.as_gas() / 1_000_000_000_000;
+        let surplus_tgas = (prepaid / 1_000_000_000_000)
+            .saturating_sub(used / 1_000_000_000_000)
+            .saturating_sub(total_deducted_tgas)
+            .saturating_sub(reserve / 1_000_000_000_000);
+        env::log_str(&format!(
+            "GAS_BUDGET: resume={}T ccall_total={}T auto={}T reserve={}T deducted={}T surplus={surplus_tgas}T",
+            resume_gas.as_gas() / 1_000_000_000_000,
+            total_ccall_gas / 1_000_000_000_000,
+            auto_resume_gas.as_gas() / 1_000_000_000_000,
+            reserve / 1_000_000_000_000,
+            total_deducted_tgas,
+        ));
 
         // Step 1: Create yield — stores data_id in register 0
         let yield_args = serde_json::json!({"yield_id": &yield_id}).to_string();
@@ -2573,11 +2740,16 @@ impl LispContract {
         let data_id = env::read_register(0).expect("promise_yield_create should write data_id");
         let data_id_hex = hex_encode(&data_id);
 
+        env::log_str(&format!(
+            "GAS_AFTER_YIELD: used={}T",
+            env::used_gas().as_gas() / 1_000_000_000_000,
+        ));
+
         // Step 2: Create N parallel cross-contract call promises
         let self_id = env::current_account_id();
 
         let mut promises: Vec<Promise> = Vec::with_capacity(n);
-        for yi in &yields {
+        for (i, yi) in yields.iter().enumerate() {
             let account_id: near_sdk::AccountId = yi
                 .account
                 .parse()
@@ -2590,7 +2762,23 @@ impl LispContract {
                 cc_gas,
             );
             promises.push(p);
+            // Log every 25th promise and the last one
+            if (i + 1) % 25 == 0 || i == n - 1 {
+                env::log_str(&format!(
+                    "GAS_AFTER_PROMISE_{}/{}: used={}T remaining={}T",
+                    i + 1, n,
+                    env::used_gas().as_gas() / 1_000_000_000_000,
+                    (prepaid - env::used_gas().as_gas()) / 1_000_000_000_000,
+                ));
+            }
         }
+
+        env::log_str(&format!(
+            "GAS_ALL_PROMISES: used={}T remaining={}T resume_gas={}T",
+            env::used_gas().as_gas() / 1_000_000_000_000,
+            (prepaid - env::used_gas().as_gas()) / 1_000_000_000_000,
+            resume_gas.as_gas() / 1_000_000_000_000,
+        ));
 
         // Step 3: Combine all promises into one, then chain single callback
         let auto_args = serde_json::json!({"data_id_hex": data_id_hex}).to_string();
