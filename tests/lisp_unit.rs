@@ -295,6 +295,7 @@ fn test_vmstate_complex_env() {
                         ]),
                     ]),
                 ])),
+                rest_param: None,
                 closed_env: Box::new(vec![]),
             },
         )],
@@ -2814,19 +2815,12 @@ fn test_empty_string() {
 #[test]
 fn test_match_nested_patterns() {
     // Nested destructuring: match (list 1 (list 2 3)) with (a (b c))
-    // If nested destructuring is not supported, this returns nil (no match)
     let code = r#"
         (match (list 1 (list 2 3))
             ((a (b c)) (str-concat (to-string a) (to-string b) (to-string c)))
             (else "no match"))
     "#;
-    let result = eval_str(code);
-    // Either works (nested destructuring) or falls through to else or returns nil
-    assert!(
-        result == "\"123\"" || result == "\"no match\"" || result == "nil",
-        "match nested: {}",
-        result
-    );
+    assert_eq!(eval_str(code), "\"123\"");
 }
 
 // --- fmt with nested dict ---
@@ -2985,3 +2979,90 @@ fn test_ecrecover_wrong_sig_length() {
 // --- near/log (unit test — env::log_str panics outside NEAR runtime) ---
 // Cannot test execution in unit tests; verified in sandbox tests.
 // The test_near_log_returns_nil test above documents this gap.
+
+// --- Variadic lambdas (&rest) ---
+
+#[test]
+fn test_variadic_sum() {
+    assert_eq!(eval_str("(define sum (lambda (&rest args) (reduce + 0 args))) (sum 1 2 3 4 5)"), "15");
+}
+
+#[test]
+fn test_variadic_with_fixed_params() {
+    assert_eq!(
+        eval_str("(define f (lambda (a b &rest rest) (+ a b (len rest)))) (f 1 2 3 4 5)"),
+        "6"  // 1 + 2 + 3 (length of rest [3,4,5])
+    );
+}
+
+#[test]
+fn test_variadic_empty_rest() {
+    assert_eq!(
+        eval_str("(define f (lambda (x &rest rest) (len rest))) (f 42)"),
+        "0"
+    );
+}
+
+#[test]
+fn test_variadic_list_capture() {
+    assert_eq!(
+        eval_str("(define f (lambda (&rest args) args)) (f 1 2 3)"),
+        "(1 2 3)"
+    );
+}
+
+#[test]
+fn test_variadic_inline_lambda() {
+    let code = "((lambda (x &rest rest) (+ x (len rest))) 10 20 30 40)";
+    assert_eq!(eval_str(code), "13");  // 10 + 3 (length of rest)
+}
+
+// --- Nested match destructuring ---
+
+#[test]
+fn test_match_nested_binding() {
+    let code = r#"
+        (match (list 1 (list 2 3))
+            ((a (b c)) (+ a b c))
+            (else -1))
+    "#;
+    assert_eq!(eval_str(code), "6");
+}
+
+#[test]
+fn test_match_triple_nested() {
+    let code = r#"
+        (match (list 1 (list 2 (list 3 4)))
+            ((a (b (c d))) (+ a b c d))
+            (else -1))
+    "#;
+    assert_eq!(eval_str(code), "10");
+}
+
+#[test]
+fn test_match_wildcard_else() {
+    assert_eq!(eval_str(r#"(match 42 (1 "one") (else "other"))"#), "\"other\"");
+}
+
+// --- Inspect builtin ---
+
+#[test]
+fn test_inspect_number() {
+    let result = eval_str("(inspect 42)");
+    assert!(result.contains("integer"), "inspect number: {}", result);
+    assert!(result.contains("42"), "inspect number: {}", result);
+}
+
+#[test]
+fn test_inspect_list() {
+    let result = eval_str("(inspect (list 1 2 3))");
+    assert!(result.contains("list"), "inspect list: {}", result);
+    assert!(result.contains("3"), "should show length: {}", result);  // list[3]
+}
+
+#[test]
+fn test_inspect_lambda() {
+    let result = eval_str("(inspect (lambda (x y) (+ x y)))");
+    assert!(result.contains("lambda"), "inspect lambda: {}", result);
+    assert!(result.contains("2"), "should show param count: {}", result);
+}

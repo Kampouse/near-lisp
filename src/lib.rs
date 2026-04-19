@@ -119,6 +119,7 @@ pub enum LispVal {
     List(Vec<LispVal>),
     Lambda {
         params: Vec<String>,
+        rest_param: Option<String>,  // &rest parameter name, collects remaining args as list
         body: Box<LispVal>,
         closed_env: Box<Vec<(String, LispVal)>>,
     },
@@ -436,15 +437,29 @@ fn do_arith(
     }
 }
 
-fn parse_params(val: &LispVal) -> Result<Vec<String>, String> {
+fn parse_params(val: &LispVal) -> Result<(Vec<String>, Option<String>), String> {
     match val {
-        LispVal::List(p) => p
-            .iter()
-            .map(|v| match v {
-                LispVal::Sym(s) => Ok(s.clone()),
-                _ => Err("param must be sym".into()),
-            })
-            .collect(),
+        LispVal::List(p) => {
+            let mut params = Vec::new();
+            let mut rest_param = None;
+            let mut seen_rest = false;
+            for v in p {
+                match v {
+                    LispVal::Sym(s) if s == "&rest" => {
+                        seen_rest = true;
+                    }
+                    LispVal::Sym(s) if seen_rest => {
+                        rest_param = Some(s.clone());
+                        seen_rest = false;
+                    }
+                    LispVal::Sym(s) => {
+                        params.push(s.clone());
+                    }
+                    _ => return Err("param must be sym".into()),
+                }
+            }
+            Ok((params, rest_param))
+        }
         _ => Err("params must be list".into()),
     }
 }
@@ -457,6 +472,7 @@ fn parse_params(val: &LispVal) -> Result<Vec<String>, String> {
 
 fn apply_lambda(
     params: &[String],
+    rest_param: &Option<String>,
     body: &LispVal,
     closed_env: &Vec<(String, LispVal)>,
     args: &[LispVal],
@@ -468,6 +484,11 @@ fn apply_lambda(
     for (i, p) in params.iter().enumerate() {
         local.push((p.clone(), args.get(i).cloned().unwrap_or(LispVal::Nil)));
     }
+    // Handle &rest: collect remaining args as list
+    if let Some(rest_name) = rest_param {
+        let rest_args: Vec<LispVal> = args.get(params.len()..).unwrap_or(&[]).to_vec();
+        local.push((rest_name.clone(), LispVal::List(rest_args)));
+    }
     lisp_eval(body, &mut local, gas)
 }
 
@@ -478,10 +499,13 @@ fn apply_lambda(
 fn match_pattern(pattern: &LispVal, value: &LispVal) -> Option<Vec<(String, LispVal)>> {
     match pattern {
         LispVal::Sym(s) if s == "_" => Some(vec![]),
+        LispVal::Sym(s) if s == "else" => Some(vec![]),  // else is wildcard in match
         LispVal::Sym(s) if s.starts_with('?') => {
             // Binding variable — strip the '?' prefix
             Some(vec![(s[1..].to_string(), value.clone())])
         }
+        // Any other symbol is a binding variable (a, b, c in (a (b c)))
+        LispVal::Sym(s) => Some(vec![(s.clone(), value.clone())]),
         LispVal::Num(n) => {
             if value == &LispVal::Num(*n) {
                 Some(vec![])
@@ -560,10 +584,44 @@ fn match_pattern(pattern: &LispVal, value: &LispVal) -> Option<Vec<(String, Lisp
                         None
                     }
                 } else {
-                    None
+                    // Bare list pattern: (a (b c)) treated as implicit list destructuring
+                    if let LispVal::List(vals) = value {
+                        if vals.len() == pats.len() {
+                            let mut all_bindings = vec![];
+                            for (p, v) in pats.iter().zip(vals.iter()) {
+                                if let Some(bindings) = match_pattern(p, v) {
+                                    all_bindings.extend(bindings);
+                                } else {
+                                    return None;
+                                }
+                            }
+                            Some(all_bindings)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
             } else {
-                None
+                // Pattern list with non-symbol first element — treat as implicit list
+                if let LispVal::List(vals) = value {
+                    if vals.len() == pats.len() {
+                        let mut all_bindings = vec![];
+                        for (p, v) in pats.iter().zip(vals.iter()) {
+                            if let Some(bindings) = match_pattern(p, v) {
+                                all_bindings.extend(bindings);
+                            } else {
+                                return None;
+                            }
+                        }
+                        Some(all_bindings)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
         }
         _ => None,
@@ -678,10 +736,11 @@ pub fn lisp_eval(
                             .unwrap_or(Ok(LispVal::Nil))
                     }
                     "lambda" => {
-                        let params = parse_params(list.get(1).ok_or("lambda: need params")?)?;
+                        let (params, rest_param) = parse_params(list.get(1).ok_or("lambda: need params")?)?;
                         let body = list.get(2).ok_or("lambda: need body")?;
                         Ok(LispVal::Lambda {
                             params,
+                            rest_param,
                             body: Box::new(body.clone()),
                             closed_env: Box::new(env.clone()),
                         })
@@ -889,16 +948,34 @@ pub fn lisp_eval(
                             Some(LispVal::Str(s)) => s.as_str(),
                             _ => return Err("require: need string module name".into()),
                         };
+                        // Optional prefix: (require "math" "m") → defines become m/fn-name
+                        let prefix: Option<&str> = match list.get(2) {
+                            Some(LispVal::Str(s)) => Some(s.as_str()),
+                            None => None,
+                            _ => return Err("require: prefix must be string".into()),
+                        };
                         // Stdlib caching: check if module was already loaded
-                        let marker = format!("__stdlib_{}__", module_name);
+                        let marker = format!("__stdlib_{}__{}", module_name, prefix.unwrap_or(""));
                         if env.iter().any(|(k, _)| k == &marker) {
                             return Ok(LispVal::Nil);
                         }
                         // Try built-in stdlib first
                         if let Some(code) = get_stdlib_code(module_name) {
-                            let module_exprs = parse_all(code)?;
-                            for expr in &module_exprs {
-                                lisp_eval(expr, env, gas)?;
+                            if let Some(pfx) = prefix {
+                                // Namespace mode: eval in sandbox, then copy defs with prefix
+                                let mut module_env: Vec<(String, LispVal)> = vec![];
+                                let module_exprs = parse_all(code)?;
+                                for expr in &module_exprs {
+                                    lisp_eval(expr, &mut module_env, gas)?;
+                                }
+                                for (k, v) in module_env {
+                                    env.push((format!("{}/{}", pfx, k), v));
+                                }
+                            } else {
+                                let module_exprs = parse_all(code)?;
+                                for expr in &module_exprs {
+                                    lisp_eval(expr, env, gas)?;
+                                }
                             }
                             env.push((marker, LispVal::Bool(true)));
                             return Ok(LispVal::Nil);
@@ -908,9 +985,20 @@ pub fn lisp_eval(
                         if let Some(bytes) = env::storage_read(storage_key.as_bytes()) {
                             let code = String::from_utf8(bytes)
                                 .map_err(|_| "require: module has invalid utf8")?;
-                            let module_exprs = parse_all(&code)?;
-                            for expr in &module_exprs {
-                                lisp_eval(expr, env, gas)?;
+                            if let Some(pfx) = prefix {
+                                let mut module_env: Vec<(String, LispVal)> = vec![];
+                                let module_exprs = parse_all(&code)?;
+                                for expr in &module_exprs {
+                                    lisp_eval(expr, &mut module_env, gas)?;
+                                }
+                                for (k, v) in module_env {
+                                    env.push((format!("{}/{}", pfx, k), v));
+                                }
+                            } else {
+                                let module_exprs = parse_all(&code)?;
+                                for expr in &module_exprs {
+                                    lisp_eval(expr, env, gas)?;
+                                }
                             }
                             env.push((marker, LispVal::Bool(true)));
                             Ok(LispVal::Nil)
@@ -1175,6 +1263,49 @@ fn dispatch_call(
                     .map(|v| format!("{}", v))
                     .unwrap_or_else(|| "error".to_string());
                 Err(msg)
+            }
+            // --- Debug builtins ---
+            "debug" | "near/log-debug" => {
+                // Log to NEAR runtime logs, return nil
+                let msg = args
+                    .get(0)
+                    .map(|v| format!("{}", v))
+                    .unwrap_or_else(|| "debug".to_string());
+                #[cfg(not(test))]
+                near_sdk::env::log_str(&format!("[DEBUG] {}", msg));
+                Ok(LispVal::Nil)
+            }
+            "trace" => {
+                // Log value to NEAR runtime logs, return the value unchanged (pass-through)
+                let val = args.get(0).cloned().unwrap_or(LispVal::Nil);
+                #[cfg(not(test))]
+                near_sdk::env::log_str(&format!("[TRACE] {}", val));
+                Ok(val)
+            }
+            "inspect" => {
+                // Return detailed type+value info string
+                let val = args.get(0).cloned().unwrap_or(LispVal::Nil);
+                let type_str = match &val {
+                    LispVal::Nil => "nil",
+                    LispVal::Bool(_) => "boolean",
+                    LispVal::Num(_) => "integer",
+                    LispVal::Float(_) => "float",
+                    LispVal::Str(_) => "string",
+                    LispVal::List(items) => {
+                        return Ok(LispVal::Str(format!("list[{}]: {}", items.len(), val)));
+                    }
+                    LispVal::Map(m) => {
+                        return Ok(LispVal::Str(format!("map{{{} keys}}: {}", m.len(), val)));
+                    }
+                    LispVal::Lambda { params, .. } => {
+                        return Ok(LispVal::Str(format!("lambda({}): <function>", params.len())));
+                    }
+                    LispVal::Sym(s) => {
+                        return Ok(LispVal::Str(format!("symbol: {}", s)));
+                    }
+                    _ => "unknown",
+                };
+                Ok(LispVal::Str(format!("{}: {}", type_str, val)))
             }
             "string?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Str(_)))),
             "map?" => Ok(LispVal::Bool(matches!(&args[0], LispVal::Map(_)))),
@@ -1651,18 +1782,19 @@ fn dispatch_call(
         }
     } else if let LispVal::Lambda {
         params,
+        rest_param,
         body,
         closed_env,
     } = head
     {
-        apply_lambda(params, body, closed_env, &args, env, gas)
+        apply_lambda(params, &rest_param, body, closed_env, &args, env, gas)
     } else if let LispVal::List(ll) = head {
         // Inline lambda: ((lambda (x) (* x x)) 5)
         if ll.len() < 3 {
             return Err("inline lambda too short".into());
         }
-        let params = parse_params(&ll[1])?;
-        apply_lambda(&params, &ll[2], &vec![], &args, env, gas)
+        let (params, rest_param) = parse_params(&ll[1])?;
+        apply_lambda(&params, &rest_param, &ll[2], &vec![], &args, env, gas)
     } else {
         Err("not callable".into())
     }
@@ -1677,12 +1809,13 @@ fn call_val(
     match func {
         LispVal::Lambda {
             params,
+            rest_param,
             body,
             closed_env,
-        } => apply_lambda(params, body, closed_env, args, env, gas),
+        } => apply_lambda(params, rest_param, body, closed_env, args, env, gas),
         LispVal::List(ll) if ll.len() >= 3 => {
-            let params = parse_params(&ll[1])?;
-            apply_lambda(&params, &ll[2], &vec![], args, env, gas)
+            let (params, rest_param) = parse_params(&ll[1])?;
+            apply_lambda(&params, &rest_param, &ll[2], &vec![], args, env, gas)
         }
         LispVal::Sym(name) => {
             // Allow raw builtin names as first-class functions:
