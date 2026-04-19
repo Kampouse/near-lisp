@@ -810,6 +810,16 @@ impl LoopCompiler {
                             self.code[jmp_idx] = Op::Jump(self.code.len());
                             true
                         }
+                        // recur: compile args, emit Recur(N) — valid in any tail position
+                        "recur" => {
+                            let num_slots = self.slot_map.len();
+                            if list.len() - 1 != num_slots { return false; }
+                            for arg in &list[1..] {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                            }
+                            self.code.push(Op::Recur(num_slots));
+                            true
+                        }
                         // and: short-circuit, returns first falsy or last value
                         // Pattern: compile arg; Dup; JumpIfFalse(end); Pop; ...next arg...
                         "and" => {
