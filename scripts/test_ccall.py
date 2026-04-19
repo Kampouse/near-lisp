@@ -320,14 +320,14 @@ test_async("multi-ccall: two sequential views",
            '(define b (near/ccall "kampy.testnet" "get_gas_limit" "{}"))\n'
            '(+ (len (list a b)) 0)',
            lambda r: r == "2",
-           gas="160 Tgas")
+           gas="80 Tgas")
 
 test_async("multi-ccall: ccall-count after 2 ccalls",
            '(near/ccall "kampy.testnet" "get_owner" "{}")\n'
            '(near/ccall "kampy.testnet" "get_gas_limit" "{}")\n'
            '(near/ccall-count)',
            lambda r: r == "2",
-           gas="160 Tgas")
+           gas="80 Tgas")
 
 test_async("three sequential ccalls + ccall-count",
            '(near/ccall "kampy.testnet" "get_owner" "{}")\n'
@@ -335,7 +335,7 @@ test_async("three sequential ccalls + ccall-count",
            '(near/ccall "kampy.testnet" "get_owner" "{}")\n'
            '(near/ccall-count)',
            lambda r: r == "3",
-           gas="210 Tgas")
+           gas="90 Tgas")
 
 # ── Sync eval sanity checks ──────────────────────────────────────────────────
 

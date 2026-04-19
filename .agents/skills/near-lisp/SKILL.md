@@ -623,7 +623,10 @@ Receipt 0 = "YIELDING", Receipt 1 = actual resume_eval result, Receipt 3 = ccall
 
 **JSON double-encoding**: View call results come back JSON-encoded. `get_owner` returns `"kampy.testnet"` (with quotes). Concatenating with `str-concat` produces `"The owner is: "kampy.testnet""`. Strip outer quotes if needed.
 
-**Cross-contract (ccall yield/resume) in sandbox**: The `promise_yield_create` / `promise_yield_resume` API used by `eval_async` / `resume_eval` may not be supported by near-workspaces sandbox (v0.22). The ccall yield path is tested via unit tests that mock yield/resume. Sandbox tests only verify the synchronous CEK path (nested if/let/cond/etc without actual ccalls). Before writing ccall sandbox tests, verify that `promise_yield_create` works in the sandbox runtime.
+**Cross-contract (ccall yield/resume) in sandbox**: CONFIRMED — `promise_yield_create` does NOT execute in near-workspaces sandbox (v0.22). Calls to `eval_async` always fail at ~1.78T gas (the yield never fires). The ccall yield path can ONLY be tested on testnet. Sandbox CAN measure non-yield costs:
+- Sync eval: ~1.5T per call
+- Ccall scanning: ~0.03T per ccall scanned (negligible — the double-scan for pending_vars is not worth optimizing)
+- The ~50T per-ccall cost is ~80% NEAR runtime overhead (promise_yield_create ~40T, deferred receipt execution, promise scheduling) — NOT Lisp computation. Gas optimization should focus on reducing ccall_gas default (10T → 3-5T for views), auto_resume_gas (5T → 3T), and reserve_gas (10T → 5T). Sandbox benchmarks exist in `tests/bench_micro.rs` and `tests/bench_gas_sandbox.rs`.
 
 ### Build pitfalls
 

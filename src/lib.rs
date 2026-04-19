@@ -1825,7 +1825,7 @@ fn extract_ccall_info(
         };
 
         let (deposit, gas_tgas) = match mode {
-            CcallMode::View => (0u128, 50u64),
+            CcallMode::View => (0u128, 10u64),
             CcallMode::Call => {
                 let deposit_str =
                     inner
@@ -2541,30 +2541,24 @@ impl LispContract {
         let state_bytes = borsh::to_vec(&state).expect("VmState serialization failed");
         env::storage_write(yield_id.as_bytes(), &state_bytes);
 
-        // Dynamic gas budget:
-        //   remaining = prepaid - used
-        //   yield_overhead = 40T (constant, consumed by promise_yield_create)
-        //   total_ccall_gas = sum of each ccall's gas_tgas
-        //   auto_resume_gas = 5T for the single callback
-        //   reserve = 10T for current fn overhead
-        //   resume_effective = remaining - yield_overhead - total_ccall - auto_resume - reserve
+        // Read gas budget FIRST, before any promise operations.
+        // Every Promise::new().function_call() deducts gas from prepaid immediately.
         let prepaid = env::prepaid_gas().as_gas();
         let used = env::used_gas().as_gas();
         let remaining = prepaid.saturating_sub(used);
-        let auto_resume_gas = Gas::from_tgas(5);
-        let reserve_gas: u64 = 10_000_000_000_000; // 10 Tgas
-        let yield_overhead: u64 = 40_000_000_000_000; // 40 Tgas
 
-        let total_ccall_gas: u64 = yields
-            .iter()
-            .map(|y| y.gas_tgas * 1_000_000_000_000)
-            .sum();
+        let total_ccall_gas: u64 = yields.iter().map(|y| y.gas_tgas * 1_000_000_000_000).sum();
+        let auto_resume_gas = Gas::from_tgas(5);
+        let yield_overhead: u64 = 40_000_000_000_000; // 40 Tgas
+        // Reserve for host function overhead: promise_yield_create, .then(), borsh, etc.
+        // These all burn gas AFTER we read used_gas but are part of the current receipt.
+        let reserve: u64 = 15_000_000_000_000; // 15 Tgas
 
         let resume_effective = remaining
             .saturating_sub(yield_overhead)
             .saturating_sub(total_ccall_gas)
             .saturating_sub(auto_resume_gas.as_gas())
-            .saturating_sub(reserve_gas);
+            .saturating_sub(reserve);
 
         let resume_gas = Gas::from_gas(resume_effective.saturating_add(yield_overhead));
 
@@ -2606,7 +2600,6 @@ impl LispContract {
         let combined = if promises.len() == 1 {
             promises.into_iter().next().unwrap()
         } else {
-            // Use Promise::and to combine all N promises
             let mut iter = promises.into_iter();
             let first = iter.next().unwrap();
             let second = iter.next().unwrap();
