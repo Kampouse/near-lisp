@@ -640,10 +640,18 @@ enum Op {
     LoadSlot(usize),
     /// Push a literal i64
     PushI64(i64),
+    /// Push a literal f64
+    PushFloat(f64),
     /// Push a literal bool
     PushBool(bool),
+    /// Push a literal string
+    PushStr(String),
     /// Push nil
     PushNil,
+    /// Duplicate top of stack
+    Dup,
+    /// Pop and discard top of stack
+    Pop,
     /// Pop stack into binding slot
     StoreSlot(usize),
     /// Arithmetic: pop 2, push result
@@ -684,36 +692,61 @@ struct CompiledLoop {
     code: Vec<Op>,
     /// PC of the loop start (for recur jumps)
     loop_start_pc: usize,
+    /// Captured outer env variables (name → value), placed in slots after bindings
+    captured: Vec<(String, LispVal)>,
 }
 
 /// Compilation context
 struct LoopCompiler {
     slot_map: Vec<String>,  // slot index → binding name
     code: Vec<Op>,
+    /// Outer env variables captured at compile time (name, value)
+    captured: Vec<(String, LispVal)>,
 }
 
 impl LoopCompiler {
     fn new(slot_names: Vec<String>) -> Self {
-        Self { slot_map: slot_names, code: Vec::new() }
+        Self { slot_map: slot_names, code: Vec::new(), captured: Vec::new() }
     }
 
-    /// Look up binding name → slot index
+    /// Look up binding name → slot index (bindings first, then captured env)
     fn slot_of(&self, name: &str) -> Option<usize> {
-        self.slot_map.iter().position(|s| s == name)
+        if let Some(idx) = self.slot_map.iter().position(|s| s == name) {
+            return Some(idx);
+        }
+        if let Some(idx) = self.captured.iter().position(|(s, _)| s == name) {
+            return Some(self.slot_map.len() + idx);
+        }
+        None
+    }
+
+    /// Try to capture an unknown symbol from outer env. Returns true if captured.
+    fn try_capture(&mut self, name: &str, outer_env: &Vec<(String, LispVal)>) -> bool {
+        if self.slot_of(name).is_some() { return true; }
+        if let Some((_, val)) = outer_env.iter().rev().find(|(k, _)| k == name) {
+            self.captured.push((name.to_string(), val.clone()));
+            return true;
+        }
+        false
     }
 
     /// Try to compile an expression. Returns false if unsupported.
-    fn compile_expr(&mut self, expr: &LispVal) -> bool {
+    fn compile_expr(&mut self, expr: &LispVal, outer_env: &Vec<(String, LispVal)>) -> bool {
         match expr {
             LispVal::Num(n) => { self.code.push(Op::PushI64(*n)); true }
+            LispVal::Float(f) => { self.code.push(Op::PushFloat(*f)); true }
             LispVal::Bool(b) => { self.code.push(Op::PushBool(*b)); true }
+            LispVal::Str(s) => { self.code.push(Op::PushStr(s.clone())); true }
             LispVal::Nil => { self.code.push(Op::PushNil); true }
             LispVal::Sym(name) => {
                 if let Some(slot) = self.slot_of(name) {
                     self.code.push(Op::LoadSlot(slot));
                     true
+                } else if self.try_capture(name, outer_env) {
+                    let slot = self.slot_of(name).unwrap();
+                    self.code.push(Op::LoadSlot(slot));
+                    true
                 } else {
-                    // Unknown variable — can't compile
                     false
                 }
             }
@@ -721,64 +754,129 @@ impl LoopCompiler {
             LispVal::List(list) => {
                 if let LispVal::Sym(op) = &list[0] {
                     match op.as_str() {
+                        // Variadic arithmetic: chain binary ops
                         "+" | "-" | "*" | "/" | "%" => {
                             let opcode = match op.as_str() {
                                 "+" => Op::Add, "-" => Op::Sub, "*" => Op::Mul,
                                 "/" => Op::Div, "%" => Op::Mod, _ => unreachable!(),
                             };
-                            // Binary: compile 2 args
-                            if list.len() == 3 {
-                                if !self.compile_expr(&list[1]) { return false; }
-                                if !self.compile_expr(&list[2]) { return false; }
-                                self.code.push(opcode);
-                                true
-                            } else {
-                                false // variadic not supported in bytecode
+                            if list.len() < 3 { return false; }
+                            if !self.compile_expr(&list[1], outer_env) { return false; }
+                            for arg in &list[2..] {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                                self.code.push(opcode.clone());
                             }
+                            true
                         }
+                        // Variadic comparison: chain binary ops
                         "=" | "<" | "<=" | ">" | ">=" => {
                             let opcode = match op.as_str() {
                                 "=" => Op::Eq, "<" => Op::Lt, "<=" => Op::Le,
                                 ">" => Op::Gt, ">=" => Op::Ge, _ => unreachable!(),
                             };
-                            if list.len() == 3 {
-                                if !self.compile_expr(&list[1]) { return false; }
-                                if !self.compile_expr(&list[2]) { return false; }
-                                self.code.push(opcode);
-                                true
-                            } else {
-                                false
+                            if list.len() < 3 { return false; }
+                            if !self.compile_expr(&list[1], outer_env) { return false; }
+                            for arg in &list[2..] {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                                self.code.push(opcode.clone());
                             }
+                            true
                         }
                         "not" => {
-                            let arg = match list.get(1) {
-                                Some(a) => a,
-                                None => return false,
-                            };
-                            if !self.compile_expr(arg) { return false; }
-                            // not = compare with false
+                            let arg = match list.get(1) { Some(a) => a, None => return false };
+                            if !self.compile_expr(arg, outer_env) { return false; }
                             self.code.push(Op::PushBool(false));
                             self.code.push(Op::Eq);
                             true
                         }
+                        // Nested if: (if test then else) — compiles to jump instructions
+                        "if" => {
+                            let test = match list.get(1) { Some(t) => t, None => return false };
+                            let then_branch = match list.get(2) { Some(t) => t, None => return false };
+                            let else_branch = list.get(3);
+                            if !self.compile_expr(test, outer_env) { return false; }
+                            let jf_idx = self.code.len();
+                            self.code.push(Op::JumpIfFalse(0));
+                            if !self.compile_expr(then_branch, outer_env) { return false; }
+                            let jmp_idx = self.code.len();
+                            self.code.push(Op::Jump(0));
+                            let else_start = self.code.len();
+                            self.code[jf_idx] = Op::JumpIfFalse(else_start);
+                            if let Some(ee) = else_branch {
+                                if !self.compile_expr(ee, outer_env) { return false; }
+                            } else {
+                                self.code.push(Op::PushNil);
+                            }
+                            self.code[jmp_idx] = Op::Jump(self.code.len());
+                            true
+                        }
+                        // and: short-circuit, returns first falsy or last value
+                        // Pattern: compile arg; Dup; JumpIfFalse(end); Pop; ...next arg...
+                        "and" => {
+                            if list.len() < 2 { return false; }
+                            let mut jump_patches: Vec<usize> = Vec::new();
+                            for (i, arg) in list[1..].iter().enumerate() {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if i + 1 < list.len() - 1 {
+                                    self.code.push(Op::Dup);
+                                    let jf_idx = self.code.len();
+                                    self.code.push(Op::JumpIfFalse(0));
+                                    self.code.push(Op::Pop);
+                                    jump_patches.push(jf_idx);
+                                }
+                            }
+                            let end_pc = self.code.len();
+                            for idx in jump_patches {
+                                self.code[idx] = Op::JumpIfFalse(end_pc);
+                            }
+                            true
+                        }
+                        // or: short-circuit, returns first truthy or last value
+                        "or" => {
+                            if list.len() < 2 { return false; }
+                            let mut jump_patches: Vec<usize> = Vec::new();
+                            for (i, arg) in list[1..].iter().enumerate() {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if i + 1 < list.len() - 1 {
+                                    self.code.push(Op::Dup);
+                                    let jt_idx = self.code.len();
+                                    self.code.push(Op::JumpIfTrue(0));
+                                    self.code.push(Op::Pop);
+                                    jump_patches.push(jt_idx);
+                                }
+                            }
+                            let end_pc = self.code.len();
+                            for idx in jump_patches {
+                                self.code[idx] = Op::JumpIfTrue(end_pc);
+                            }
+                            true
+                        }
+                        // progn / begin: evaluate all, return last
+                        "progn" | "begin" => {
+                            if list.len() < 2 {
+                                self.code.push(Op::PushNil);
+                                return true;
+                            }
+                            for (i, arg) in list[1..].iter().enumerate() {
+                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if i + 1 < list.len() - 1 {
+                                    self.code.push(Op::Pop);
+                                }
+                            }
+                            true
+                        }
                         _ => {
-                            // Unknown function call — try as builtin call
                             if list.len() > 1 {
                                 let n_args = list.len() - 1;
                                 for arg in &list[1..] {
-                                    if !self.compile_expr(arg) { return false; }
+                                    if !self.compile_expr(arg, outer_env) { return false; }
                                 }
                                 self.code.push(Op::BuiltinCall(op.clone(), n_args));
                                 true
-                            } else {
-                                false
-                            }
+                            } else { false }
                         }
                     }
-                } else {
-                    // First element is not a symbol — can't compile
-                    false
-                }
+                } else { false }
             }
             _ => false,
         }
@@ -789,82 +887,67 @@ impl LoopCompiler {
         mut self,
         init_vals: Vec<LispVal>,
         body: &LispVal,
+        outer_env: &Vec<(String, LispVal)>,
     ) -> Option<CompiledLoop> {
         let num_slots = self.slot_map.len();
-        let loop_start_pc = 0; // will be set after compilation
 
-        // Try to compile body as: (if TEST then (recur args...))
-        // or: (if TEST then else)
         if let LispVal::List(parts) = body {
             if parts.first() == Some(&LispVal::Sym("if".into())) {
                 let test = parts.get(1)?;
                 let then_branch = parts.get(2)?;
                 let else_branch = parts.get(3);
 
-                // Compile test
-                if !self.compile_expr(test) { return None; }
-
-                // JumpIfFalse to else/recur
+                if !self.compile_expr(test, outer_env) { return None; }
                 let jf_idx = self.code.len();
-                self.code.push(Op::JumpIfFalse(0)); // placeholder
-
-                // Compile then branch
-                if !self.compile_expr(then_branch) { return None; }
+                self.code.push(Op::JumpIfFalse(0));
+                if !self.compile_expr(then_branch, outer_env) { return None; }
                 self.code.push(Op::Return);
-
-                // Fix up jump target
                 let else_start = self.code.len();
-                if let Some(Op::JumpIfFalse(_)) = self.code.get(jf_idx) {
-                    self.code[jf_idx] = Op::JumpIfFalse(else_start);
-                }
+                self.code[jf_idx] = Op::JumpIfFalse(else_start);
 
-                // Compile else branch
                 if let Some(else_expr) = else_branch {
                     if let LispVal::List(else_parts) = else_expr {
                         if else_parts.first() == Some(&LispVal::Sym("recur".into())) {
-                            // Recur: compile args, then store into slots in reverse
                             let recur_args = &else_parts[1..];
                             if recur_args.len() != num_slots { return None; }
                             for arg in recur_args {
-                                if !self.compile_expr(arg) { return None; }
+                                if !self.compile_expr(arg, outer_env) { return None; }
                             }
                             self.code.push(Op::Recur(num_slots));
                         } else {
-                            // Regular else expr
-                            if !self.compile_expr(else_expr) { return None; }
+                            if !self.compile_expr(else_expr, outer_env) { return None; }
                             self.code.push(Op::Return);
                         }
                     } else {
-                        if !self.compile_expr(else_expr) { return None; }
+                        if !self.compile_expr(else_expr, outer_env) { return None; }
                         self.code.push(Op::Return);
                     }
                 } else {
-                    // No else — return nil
                     self.code.push(Op::PushNil);
                     self.code.push(Op::Return);
                 }
-
+                let captured = self.captured.clone();
                 return Some(CompiledLoop {
                     num_slots,
                     slot_names: self.slot_map,
                     init_vals,
                     code: self.code,
-                    loop_start_pc,
+                    loop_start_pc: 0,
+                    captured,
                 });
             }
-
-            // Body without if — just compile and return
-            if !self.compile_expr(body) { return None; }
+            if !self.compile_expr(body, outer_env) { return None; }
             self.code.push(Op::Return);
+            let captured = self.captured.clone();
             return Some(CompiledLoop {
                 num_slots,
                 slot_names: self.slot_map,
                 init_vals,
                 code: self.code,
-                loop_start_pc,
+                loop_start_pc: 0,
+                captured,
             });
         }
-
         None
     }
 }
@@ -875,8 +958,12 @@ fn run_compiled_loop(
     gas: &mut u64,
     outer_env: &mut Vec<(String, LispVal)>,
 ) -> Result<LispVal, String> {
-    // Slot-based env: direct index access, no string keys
+    // Slot-based env: binding slots + captured env slots, direct index access
     let mut slots: Vec<LispVal> = cl.init_vals.clone();
+    // Append captured env values after binding slots
+    for (_, val) in &cl.captured {
+        slots.push(val.clone());
+    }
     let mut stack: Vec<LispVal> = Vec::with_capacity(16);
     let code = &cl.code;
     let mut pc: usize = 0;
@@ -894,12 +981,30 @@ fn run_compiled_loop(
                 stack.push(LispVal::Num(*n));
                 pc += 1;
             }
+            Op::PushFloat(f) => {
+                stack.push(LispVal::Float(*f));
+                pc += 1;
+            }
             Op::PushBool(b) => {
                 stack.push(LispVal::Bool(*b));
                 pc += 1;
             }
+            Op::PushStr(s) => {
+                stack.push(LispVal::Str(s.clone()));
+                pc += 1;
+            }
             Op::PushNil => {
                 stack.push(LispVal::Nil);
+                pc += 1;
+            }
+            Op::Dup => {
+                if let Some(top) = stack.last() {
+                    stack.push(top.clone());
+                }
+                pc += 1;
+            }
+            Op::Pop => {
+                stack.pop();
                 pc += 1;
             }
             Op::StoreSlot(s) => {
@@ -1094,9 +1199,10 @@ pub fn try_compile_loop(
     binding_names: &[String],
     binding_vals: Vec<LispVal>,
     body: &LispVal,
+    outer_env: &Vec<(String, LispVal)>,
 ) -> Option<CompiledLoop> {
     let compiler = LoopCompiler::new(binding_names.to_vec());
-    compiler.compile_body(binding_vals, body)
+    compiler.compile_body(binding_vals, body, outer_env)
 }
 
 /// Execute a compiled loop
@@ -1391,7 +1497,7 @@ pub fn lisp_eval(
                                 }
                             }
                             // Try bytecode compilation for the loop body
-                            if let Some(cl) = try_compile_loop(&binding_names, binding_vals.clone(), body) {
+                            if let Some(cl) = try_compile_loop(&binding_names, binding_vals.clone(), body, env) {
                                 return exec_compiled_loop(&cl, gas, env);
                             }
                             // Fallback: tree-walk interpreter

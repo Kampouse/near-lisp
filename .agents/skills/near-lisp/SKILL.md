@@ -699,7 +699,7 @@ if let Some(LispVal::Macro { params, rest_param, body, closed_env }) = macro_val
 
 **Separate test files**: You CAN create separate test files (e.g. `tests/lisp_coverage.rs`) with their own `eval_str`, `eval_str_gas`, `setup_test_vm`, and `setup_contract` helpers. They compile and run independently via `cargo test --test lisp_coverage`. This is cleaner than appending hundreds of tests to the monolithic `lisp_unit.rs`.
 
-**Pre-existing test failures** (as of 2026-04): `test_deep_recursion_gas_limit` and `test_fibonacci_15` stack overflow in debug builds. `test_defmacro_basic`, `test_defmacro_quasiquote`, `test_defmacro_rest_param`, `test_macroexpand` fail with "out of gas" at 10k default. Skip with `--skip test_deep_recursion_gas_limit --skip test_fibonacci_15`.
+**Pre-existing test failures** (as of 2026-04): `test_deep_recursion_gas_limit` and `test_fibonacci_15` stack overflow in debug builds. 6 defmacro/macroexpand tests fail (pre-existing gas budget issue — macros need high gas). 12 bytes tests fail (feature not implemented). Skip with `--skip test_deep_recursion_gas_limit --skip test_fibonacci_15`. Typical results: 333 lisp_unit pass, 23 lib pass.
 
 **`near/log` test gap**: The `test_near_log_returns_nil` test was an empty placeholder with a comment saying "may panic in unit tests". This is wrong — `near/log` works fine in unit tests if `setup_test_vm()` is called first (the VMContext mock handles `env::log_str`).
 
@@ -973,10 +973,16 @@ The following optimizations were applied to reduce on-chain gas cost:
 
 **P0 — loop/recur bytecode VM (DEPLOYED, ~10x faster than tree-walk)**:
 - `loop/recur` with simple bodies (arith, comparisons, builtins, if/else branching) compiles to a register-based bytecode VM instead of tree-walking.
-- Opcodes: `PushI64`, `PushBool`, `PushNil`, `LoadSlot`, `StoreSlot`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Eq`, `Lt`, `Le`, `Gt`, `Ge`, `JumpIfFalse`, `JumpIfTrue`, `Jump`, `Return`, `Recur`, `BuiltinCall(name, nargs)`.
-- `LoopCompiler` struct builds slot map (binding name → slot index) and emits ops. `try_compile_loop()` attempts compilation; returns `None` for unsupported expressions (falls back to tree-walk).
-- `run_compiled_loop()` executes the bytecode with a value stack + slot array. `Recur(N)` pops N args from stack into slots and jumps to loop start.
+- Opcodes: `PushI64`, `PushFloat`, `PushBool`, `PushStr`, `PushNil`, `Dup`, `Pop`, `LoadSlot`, `StoreSlot`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Eq`, `Lt`, `Le`, `Gt`, `Ge`, `JumpIfFalse`, `JumpIfTrue`, `Jump`, `Return`, `Recur`, `BuiltinCall(name, nargs)`.
+- `LoopCompiler` struct builds slot map (binding name → slot index) and emits ops. Also captures outer env variables at compile time into extra slots (placed after binding slots). `try_compile_loop()` attempts compilation; returns `None` for unsupported expressions (falls back to tree-walk). Signature: `try_compile_loop(binding_names, binding_vals, body, outer_env)`.
+- `run_compiled_loop()` executes the bytecode with a value stack + slot array (binding slots + captured env slots). `Recur(N)` pops N args from stack into binding slots and jumps to loop start.
 - `BuiltinCall` handles: `abs`, `min`, `max`, `to-string`, `str`, `car`, `cdr`, `cons`, `list`, `len`, `append`, `nth`, `nil?`, `list?`, `number?`, `string?`, `zero?`, `pos?`, `neg?`, `even?`, `odd?`.
+- **Variadic arithmetic/comparison**: `(+ a b c)` chains binary ops — compiles first arg, then for each remaining arg: compile + emit opcode. Supports 3+ args.
+- **Nested if**: `(if test (if test2 a b) c)` compiles to nested jump instructions with proper patch-up.
+- **Outer env capture**: `LoopCompiler` has `captured: Vec<(String, LispVal)>` — unknown symbols are looked up in `outer_env` at compile time and stored as extra slots. `(let ((x 10)) (loop ... (+ i x)))` compiles x into a captured slot.
+- **and/or**: short-circuit with `Dup` + `JumpIfFalse`/`JumpIfTrue` + `Pop`. Returns first falsy/truthy or last value.
+- **progn/begin**: evaluate all exprs, `Pop` intermediates, return last.
+- **NOT supported in bytecode** (falls back to tree-walk): `let`/`try`/`match` (env mutation), `define`/`lambda` (scope creation), `quote`/`defmacro`/`macroexpand`, `BuiltinCall` with non-builtin names, `recur` inside nested `if` branches (recur only valid in top-level loop body tail position).
 - Compilation is attempted at `loop` form entry in `lisp_eval` — if `try_compile_loop` returns `None`, falls back to existing tree-walk interpreter seamlessly.
 - Helper functions `num_val` (owned) and `num_val_ref` (&ref) for extracting i64 from LispVal in both VM (owned stack.pop) and tree-walk (borrowed) contexts.
 - **On-chain benchmarks** (kampy.testnet):
