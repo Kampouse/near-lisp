@@ -2548,11 +2548,9 @@ impl LispContract {
         let remaining = prepaid.saturating_sub(used);
 
         let total_ccall_gas: u64 = yields.iter().map(|y| y.gas_tgas * 1_000_000_000_000).sum();
-        let auto_resume_gas = Gas::from_tgas(5);
+        let auto_resume_gas = Gas::from_tgas(3);
         let yield_overhead: u64 = 40_000_000_000_000; // 40 Tgas
-        // Reserve for host function overhead: promise_yield_create, .then(), borsh, etc.
-        // These all burn gas AFTER we read used_gas but are part of the current receipt.
-        let reserve: u64 = 15_000_000_000_000; // 15 Tgas
+        let reserve: u64 = 10_000_000_000_000; // 10 Tgas
 
         let resume_effective = remaining
             .saturating_sub(yield_overhead)
