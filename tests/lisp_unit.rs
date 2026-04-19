@@ -551,46 +551,6 @@ fn test_multi_ccall_env_accumulates_across_yields() {
     }
 }
 
-fn test_multi_ccall_gas_decreases_across_yields() {
-    // Verify gas decreases across yield/resume cycles
-    let mut env = Vec::new();
-    let code = r#"
-        (define x 42)
-        (define a (near/ccall "x.near" "f" "{}"))
-        (+ x 1)
-        (define b (near/ccall "y.near" "g" "{}"))
-    "#;
-
-    let result1 = run_program_with_ccall(code, &mut env, 10_000).unwrap();
-    let state = match &result1 {
-        RunResult::Yield { yields, state } => {
-            // Only first ccall batches (non-ccall (+ x 1) breaks the batch)
-            assert_eq!(yields.len(), 1);
-            assert_eq!(yields[0].account, "x.near");
-            // Gas decreased from initial 10_000
-            assert!(state.gas < 10_000, "gas should decrease after yield");
-            state.clone()
-        }
-        RunResult::Done(_) => panic!("Expected Yield"),
-    };
-
-    // Resume: inject a result, run remaining which has non-ccall then second ccall
-    let mut env2 = state.env.clone();
-    env2.push(("a".to_string(), LispVal::Str("r1".to_string())));
-    let mut gas2 = state.gas;
-    let result2 = run_remaining_with_ccall(&state.remaining, &mut env2, &mut gas2).unwrap();
-
-    match &result2 {
-        RunResult::Yield { yields, state: state2 } => {
-            assert_eq!(yields.len(), 1);
-            assert_eq!(yields[0].account, "y.near");
-            // Gas decreased further
-            assert!(state2.gas < state.gas, "gas should decrease across yields");
-        }
-        RunResult::Done(_) => panic!("Expected second Yield"),
-    }
-}
-
 #[test]
 fn test_multi_ccall_standalone_ccall_chain() {
     // Standalone ccalls separated by (near/ccall-result) — non-ccall breaks batch

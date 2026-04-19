@@ -564,9 +564,29 @@ All functions below are **native builtins** — no `require "list"` needed. They
 
 - Every `lisp_eval` call consumes **1 gas unit**
 - Storage ops consume **additional 100 gas** each
-- Default eval gas limit: **10,000** (configurable by owner)
+- Default eval gas limit: **10,000** (configurable by owner). Testnet contract is set to **300T** (300,000,000,000,000) to match NEAR's 300 Tgas receipt cap.
 - Out of gas → `ERROR: out of gas` (catchable via `try/catch`)
-- `loop/recur` is more gas-efficient than naive recursion (no closure allocation per step)
+- `loop/recur` is the ONLY iteration pattern with zero stack growth. It costs exactly **8 gas per iteration** (formula: `8n + 7`). At 10K gas: count to 1,249. At 100T testnet limit: theoretical 12.5T iterations.
+- **Important: internal Lisp gas ≠ real NEAR gas.** Lisp gas is 1 tick per `lisp_eval` call regardless of allocation cost. On-chain, NEAR charges per WASM instruction.
+- **Bytecode loop VM (deployed)**: `loop/recur` with simple bodies compiles to a register-based bytecode VM — ~10x faster than the old tree-walk. On-chain benchmarks (kampy.testnet, 300 Tgas cap):
+
+| Pattern | Iterations | Total Gas | Per-iter |
+|---------|-----------|-----------|----------|
+| 1-binding count `(loop ((i 0)) ...)` | 1,000 | 4.36 Tgas | 4.36 Ggas |
+| 1-binding count | 10,000 | 25.14 Tgas | 2.51 Ggas |
+| 1-binding count | 50,000 | 117.48 Tgas | 2.35 Ggas |
+| 1-binding count | 100,000 | 232.92 Tgas | 2.33 Ggas |
+| 2-binding count `(loop ((i 0) (sum 0)) ...)` | 10,000 | 35.02 Tgas | 3.50 Ggas |
+| 2-binding count | 100,000 | 301.20 Tgas | 3.01 Ggas |
+| Baseline (no loop, eval `"1"`) | — | 1.98 Tgas | — |
+
+- **Max iterations at 300 Tgas**: 129,672 (1-binding, binary searched on-chain)
+- **Per-iteration cost** (amortized, converges at high N): ~2.3 Ggas/iter (1-binding), ~3.0 Ggas/iter (2-binding), ~0.7 Ggas marginal per extra binding
+- **Old tree-walk cost** (for comparison): ~22.45 Ggas/iter, max ~13,350 iterations
+- The internal gas limit should be set to 300T (`set_gas_limit(300000000000000)`) to match NEAR's receipt gas cap.
+- **On-chain gas benchmarking method**: `near` CLI truncates gas to 3 decimal Tgas — useless for precision. Use RPC `EXPERIMENTAL_tx_status` for exact gas: extract tx hash from CLI output, then `curl RPC -d '{"method":"EXPERIMENTAL_tx_status","params":["TX_HASH","ACCOUNT"]}'`, sum `transaction_outcome.gas_burnt` + all `receipts_outcome[].outcome.gas_burnt`.
+- **TCO trampoline does NOT help tail-recursive lambdas.** `(define count (lambda (n i) (if (= i n) i (count n (+ i 1)))))` still recurses through `dispatch_call` → `apply_lambda` → `lisp_eval` — real Rust stack frames. Stack overflows at ~100-200 depth. Only `loop/recur` avoids this.
+- **Recursive fib gas cost**: grows at exactly 1.62x per n (golden ratio). fib(13) = 6777 gas, fib(19) = 121,761 gas. Stack overflows at fib(20) in debug builds.
 
 ## NEP-297 Events
 
@@ -699,50 +719,62 @@ if let Some(LispVal::Macro { params, rest_param, body, closed_env }) = macro_val
 
 When making large sets of changes to `src/lib.rs`:
 - **The `patch` tool (mode=replace) is most reliable** for individual targeted changes — it does fuzzy matching and handles whitespace differences.
+- **DUPLICATE PATTERN PITFALL**: When the same code pattern exists in multiple places (e.g. `"not" => {` appears in both `compile_expr` ~line 754 and `lisp_eval` ~line 1273), the patch tool may match the WRONG occurrence. Always include enough surrounding context to make the match unique, or verify with `read_file` at the exact line range before patching. When I patched `"not" => { ... }`, it matched the lisp_eval handler instead of the compile_expr handler three times in a row — destroying working code each time. Fix: use line-specific context (like the function signature or nearby unique identifiers) to disambiguate.
 - **For major rewrites (like TCO refactoring lisp_eval)**: write the complete replacement function to a temp file first, then use a Python script to splice it into the main file at the correct line boundaries. Do NOT try to patch 300+ lines incrementally.
 - **Python scripts doing string replacement** work for the initial batch of changes but break on subsequent rounds because rustfmt (invoked by the patch tool's lint check) reformat changes the whitespace.
 - **Never use `read_file()` output for string matching** — it adds line number prefixes (`"  123|..."`). Use `terminal("cat path")` for raw content, or just use the `patch` tool directly.
 
-### Key implementation detail: TCO trampoline in Rust
+### Key implementation detail: TCO trampoline in Rust (DEPLOYED)
 
-Converting `lisp_eval` from recursive to iterative (tail-call optimization via trampoline loop):
+`lisp_eval` uses a labeled trampoline loop. Tail positions rebind `current_expr` and `continue '_trampoline` instead of recursing. Every value-producing arm uses explicit `return`.
 
 ```rust
 pub fn lisp_eval(expr: &LispVal, env: &mut Vec<(String, LispVal)>, gas: &mut u64) -> Result<LispVal, String> {
     let mut current_expr: LispVal = expr.clone();
-    loop {
-        // ... gas check ...
+    '_trampoline: loop {
+        if *gas == 0 { return Err("out of gas".into()); }
+        *gas -= 1;
         match &current_expr {
             // Self-evaluating: return directly
-            // Special forms: rebind current_expr + continue (instead of recursing)
-            "if" => { current_expr = chosen_branch; continue; }
-            "cond" => { /* break+flag pattern — see below */ }
-            "progn" => { current_expr = last_expr; continue; }
+            | LispVal::Bool(_) | LispVal::Num(_) ... => return Ok(current_expr.clone()),
+            // Special forms with TCO:
+            "if"    => { current_expr = chosen_branch; continue '_trampoline; }
+            "cond"  => { /* break+flag, then continue '_trampoline */ }
+            "progn" => { current_expr = last_expr; continue '_trampoline; }
+            "and"   => { current_expr = last_expr; continue '_trampoline; }
+            "or"    => { current_expr = last_expr; continue '_trampoline; }
+            // No TCO (env cleanup requires recursive call):
+            "let" | "try" | "match" => { ... return result; }
+            // Value-producing (always explicit return):
+            "define" | "lambda" | "not" | "near/*" | "require" => { ... return Ok(...); }
+            // loop/recur has its own inner Rust loop (unchanged):
+            "loop" => { let result = loop { ... break val; }; return Ok(result); }
         }
     }
 }
 ```
 
-**Nested loop problem**: `cond` and `match` iterate clauses with `for`. A bare `continue` inside `for` continues the `for` loop, NOT the outer trampoline `loop`. Fix: use break+flag pattern:
+**Critical Rust type requirement**: Every match arm must end with `return Ok(...)` or `continue '_trampoline`. Bare `Ok(LispVal::Nil)` compiles as a tail expression of type `Result` — but the `loop` body expects no value (the loop never breaks). Adding `return` to every arm fixes this.
+
+**Nested loop problem — labeled continue**: `cond` and `match` iterate clauses with `for`. A bare `continue` inside `for` continues the `for` loop, NOT the outer trampoline. Fix: use a labeled loop (`'_trampoline`) with break+flag pattern:
 ```rust
 "cond" => {
-    let mut tail_expr: Option<LispVal> = None;
+    let mut found: Option<LispVal> = None;
     for clause in &list[1..] {
-        if /* matches */ {
-            tail_expr = Some(body_expr);
-            break;  // breaks for loop
-        }
+        if /* matches */ { found = Some(body); break; }
     }
-    match tail_expr {
-        Some(e) => { current_expr = e; continue; }  // continues outer loop
+    match found {
+        Some(e) => { current_expr = e; continue '_trampoline; }
         None => return Ok(LispVal::Nil),
     }
 }
 ```
 
-**What to tail-optimize**: `if`, `cond`, `let` (body), `progn`/`begin` (last), `match` (body), `try`/`catch` (handler). What NOT to: `define`, `lambda`, `defmacro` (they return values, not tail calls). `loop`/`recur` already has its own Rust loop. `and`/`or` can't fully TCO because they must return intermediate falsy/truthy values.
+**What IS tail-optimized** (no stack growth): `if`, `cond`, `progn`/`begin`, `and`, `or`.
+**What is NOT tail-optimized** (still recursive): `let`, `try/catch`, `match` — these need env cleanup (push + truncate) so the body must be a recursive call. `loop`/`recur` has its own inner Rust loop. `define`, `lambda`, `near/*` all return values immediately.
 - **`dispatch_call` evaluates all args upfront**: `let args: Vec<LispVal> = list[1..].iter().map(|a| lisp_eval(a, env, gas))...` — builtins use `args[N]`, NOT `eval_arg` (which doesn't exist in dispatch context).
 - **`hex_decode`/`hex_encode` already exist** as helper functions in the codebase — don't import the `hex` crate.
+- **`loop`/`recur` arm must use `break` not `return` from inner loop**: Use `let result = loop { ... break val; }; return Ok(result);` — the inner loop breaks with the value, then the trampoline arm returns it. Using `unreachable!()` after an infinite loop is cleaner but Rust doesn't guarantee the inner loop type-infers correctly.
 
 ### Key implementation detail: quote shorthand
 Requires TWO changes: tokenizer must emit `'` as a standalone token (add to delimiter check), AND parser must handle `"'"` case to wrap in `(quote expr)`. Missing either one silently breaks.
@@ -838,9 +870,9 @@ cd ~/.openclaw/workspace/near-lisp-clean
 python3 scripts/testnet_smoke.py
 ```
 
-Runs 129 tests against the live testnet contract. Uses `near contract call-function as-transaction` with inline JSON args. Returns pass/fail per test with summary.
+Runs 144 tests against the live testnet contract. Uses `near contract call-function as-transaction` with inline JSON args. Returns pass/fail per test with summary.
 
-**Important**: Use `prepaid-gas '100 Tgas'` minimum for tests involving `require` — 30 Tgas is too low for stdlib loading + computation. The `near` CLI does NOT support `file://` scheme for `json-args` — must use inline JSON strings.
+**Important**: Some tests involving `require` may need higher gas. The script uses 30 Tgas per call which works for most tests. Increase to `100 Tgas` if stdlib-loading tests fail with out-of-gas errors. The `near` CLI does NOT support `file://` scheme for `json-args` — must use inline JSON strings.
 
 ## On-Chain Bugs — Status (2026-04)
 
@@ -874,7 +906,7 @@ Runs 129 tests against the live testnet contract. Uses `near contract call-funct
 
 **NEW — inspect builtin**: `(inspect x)` returns type+value description string for debugging.
 
-**DONE — Bytes type**: `LispVal::Bytes(Vec<u8>)` for binary data. 8 builtins: `hex->bytes`, `bytes-hex`, `bytes->hex`, `bytes-len`, `bytes->string`, `string->bytes`, `bytes-concat`, `bytes-slice`. Uses existing `hex_decode`/`hex_encode` helpers. Display shows `0x...` hex. `type?` returns `"bytes"`. All builtins use `args[N]` pattern in `dispatch_call`. 12 unit tests in `tests/lisp_coverage.rs` — covers all 8 builtins + roundtrip + type check + empty bytes + alias.
+**NOT IMPLEMENTED — Bytes type**: `LispVal::Bytes(Vec<u8>)` and its 8 builtins (`hex->bytes`, `bytes-hex`, `bytes->hex`, `bytes-len`, `bytes->string`, `string->bytes`, `bytes-concat`, `bytes-slice`) are documented in the Language Reference section of SKILL.md but do NOT exist in the current code. 12 tests in `tests/lisp_coverage.rs` fail with `"undefined: hex->bytes"`. The `hex_decode`/`hex_encode` helpers DO exist in the codebase — just no `LispVal::Bytes` variant or dispatch_call handlers.
 
 **Testing ccall yield/resume on-chain**: The `near` CLI only shows the first receipt's return value ("YIELDING"). The actual result from `resume_eval` is in a deferred receipt. Use `scripts/test_ccall.py` for automated testing, or manually query RPC:
 ```bash
@@ -908,10 +940,10 @@ python3 scripts/test_ccall.py --verbose # show receipt details on failure
 - `tests/lisp_sandbox.rs` — sandbox integration tests
 - `tests/test_examples.rs` — parse-only validation for example files
 - `scripts/test_ccall.py` — 21 on-chain ccall tests
-- `scripts/testnet_smoke.py` — 129 on-chain smoke tests
+- `scripts/testnet_smoke.py` — 144 on-chain smoke tests
 
 **NOW COVERED (added in test coverage fix):**
-- Bytes type: all 8 builtins + roundtrip + type + empty + alias (12 tests)
+- Bytes type: 12 tests in lisp_coverage.rs but ALL FAIL — builtins not implemented yet (see "NOT IMPLEMENTED" in bugs section)
 - Custom modules: save/get/list/remove + invalid parse (5 tests)
 - require namespace prefix: (require "math" "m") → m/abs, m/max, caching (3 tests)
 - require "crypto" stdlib: hash/sha256-bytes, hash/keccak256-bytes (2 tests)
@@ -925,7 +957,7 @@ python3 scripts/test_ccall.py --verbose # show receipt details on failure
 - Nothing — all documented features now have code + tests.
 
 **STILL NOT TESTED ON-CHAIN (unit-only):**
-- dict ops, to-json/from-json, fmt, match, try/catch, inspect, defmacro, variadic lambdas, near/batch-call, near/transfer, all string/math stdlib, reverse/sort/range/zip/find/some/every, float arithmetic
+- variadic lambdas (&rest), near/batch-call, near/transfer
 
 ## Gas Optimizations (2026-04)
 
@@ -939,7 +971,22 @@ The following optimizations were applied to reduce on-chain gas cost:
 - Both functions scanned ccall expressions TWICE: once to build the yield batch, once with a full env clone to extract pending_vars. Now extracts pending_vars from the already-collected batch in a single pass.
 - Impact: eliminates one full env clone + N re-evaluations of ccall expressions per yield cycle.
 
-**P1 — loop/recur: push/pop instead of env clone**:
+**P0 — loop/recur bytecode VM (DEPLOYED, ~10x faster than tree-walk)**:
+- `loop/recur` with simple bodies (arith, comparisons, builtins, if/else branching) compiles to a register-based bytecode VM instead of tree-walking.
+- Opcodes: `PushI64`, `PushBool`, `PushNil`, `LoadSlot`, `StoreSlot`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Eq`, `Lt`, `Le`, `Gt`, `Ge`, `JumpIfFalse`, `JumpIfTrue`, `Jump`, `Return`, `Recur`, `BuiltinCall(name, nargs)`.
+- `LoopCompiler` struct builds slot map (binding name → slot index) and emits ops. `try_compile_loop()` attempts compilation; returns `None` for unsupported expressions (falls back to tree-walk).
+- `run_compiled_loop()` executes the bytecode with a value stack + slot array. `Recur(N)` pops N args from stack into slots and jumps to loop start.
+- `BuiltinCall` handles: `abs`, `min`, `max`, `to-string`, `str`, `car`, `cdr`, `cons`, `list`, `len`, `append`, `nth`, `nil?`, `list?`, `number?`, `string?`, `zero?`, `pos?`, `neg?`, `even?`, `odd?`.
+- Compilation is attempted at `loop` form entry in `lisp_eval` — if `try_compile_loop` returns `None`, falls back to existing tree-walk interpreter seamlessly.
+- Helper functions `num_val` (owned) and `num_val_ref` (&ref) for extracting i64 from LispVal in both VM (owned stack.pop) and tree-walk (borrowed) contexts.
+- **On-chain benchmarks** (kampy.testnet):
+  - 1-binding counting loop: ~2.3 Ggas/iter at scale (was ~22.45 Ggas/iter tree-walk)
+  - 2-binding counting loop: ~3.0 Ggas/iter at scale
+  - Marginal cost per extra binding: ~0.7 Ggas
+  - Max iterations at 300 Tgas: 129,672 (1-binding)
+  - Baseline (no loop): 1.98 Tgas
+
+**P1 — loop/recur: push/pop instead of env clone** (tree-walk fallback):
 - Every loop iteration cloned the entire env. Now pushes bindings directly into env, evaluates body, then truncates (pops) the bindings. Zero allocation per iteration.
 - Impact: loop with 100 iterations on an env with 20 bindings goes from 100 × clone(20 entries) to 100 × push/pop.
 
@@ -955,9 +1002,15 @@ The following optimizations were applied to reduce on-chain gas cost:
 **P1 — sandbox_key: documented as already fast**:
 - `sandbox_key` uses `.rev().find()` to locate `__storage_prefix__`. Since it's pushed early at setup (near the end of the env vector), the reverse scan hits it in O(1) in practice.
 
+**P0 — apply_lambda: push/pop instead of double-env-clone (DEPLOYED):**
+- Old: `let mut local = closed_env.clone(); local.extend(caller_env.iter().cloned())` — clones BOTH envs every function call.
+- New: pushes closed_env entries + params into caller_env, evals body, truncates. Only clones closed_env (typically small — just the capture scope), NOT caller_env (which grows unboundedly).
+- Side effect: fixes lexical scoping — closed_env entries now shadow original caller_env entries (via `.rev().find()` order), instead of caller_env shadowing closed_env (dynamic scoping bug). Recursive bindings like `(define fib ...)` still work because `fib` is in the original caller_env portion, not in closed_env.
+- Impact: `(map (lambda (x) (* x 2)) (list 1..100))` with 30-entry env goes from 100 × (30+30) = 6000 entry clones to 100 × 30 = 3000.
+
 **NOT changed (and why):**
 - `env` is still `Vec<(String, LispVal)>` with linear scan — switching to `HashMap` would break Borsh serialization for `VmState` (used in yield/resume). Would need a custom serializer.
-- `apply_lambda` still clones `closed_env` — `Rc` doesn't implement BorshDeserialize. The `Box<Vec<>>` choice was made for WASM compatibility.
+- `apply_lambda` still clones `closed_env` entries — `Rc` doesn't implement BorshDeserialize. `Box<Vec<>>` is required for WASM. Could be eliminated with a two-env approach (threading a closure_env reference through lisp_eval) but that's a 77-call-site refactor.
 - `range` already allocates a `Vec` but this is the standard pattern for on-chain iteration — lazy iterators don't help in a Lisp interpreter that materializes lists.
 
 ## Known Code Issues (as of audit 2025-04)
@@ -1052,11 +1105,18 @@ Two copies exist and must be kept in sync:
 - `~/.openclaw/workspace/near-lisp-clean/.agents/skills/near-lisp/SKILL.md` (project-local)
 After editing either: `cp ~/.openclaw/workspace/near-lisp-clean/.agents/skills/near-lisp/SKILL.md ~/.hermes/skills/near-lisp/SKILL.md`
 
-## Key implementation detail: why caller_env must stay in apply_lambda
-The env uses Vec + `.rev().find()` (last-wins semantics). closed_env is pushed AFTER caller_env, so closed_env already shadows caller_env correctly. BUT: you can't remove caller_env entirely because:
-- `(define fib (lambda ...))` — lambda captures env at creation time via `env.clone()`. At that point, `fib` is NOT in env yet (define pushes after eval). Recursion only works because caller_env leaks `fib` in.
-- Placeholder pattern (push Nil first, create lambda, update) fails because lambda's `closed_env` copies `env.clone()` at creation time — it captures `fib = Nil`, not the real lambda. Updating the env after doesn't retroactively update the closed_env copy.
-- Full fix requires either Rc<RefCell> for shared mutable env, or a letrec-style separate pass.
+## Key implementation detail: apply_lambda push/pop semantics
+
+`apply_lambda` pushes closed_env entries + params into caller_env directly (no separate `local` vec). After body eval, it truncates back. This gives correct lexical scoping:
+
+**Lookup order via `.rev().find()`:** params > closed_env > original caller_env
+- Params shadow everything (correct)
+- closed_env shadows original caller_env (correct lexical scoping — captures definition scope)
+- Original caller_env entries are still found if not shadowed (recursive bindings work)
+
+**Why recursive `fib` still works:** `(define fib (lambda ...))` — `fib` is in the ORIGINAL caller_env (pushed by `define`), NOT in closed_env (fib didn't exist when lambda was created). `.rev().find()` finds it in the original portion.
+
+**Why it's an improvement over the old code:** The old `local = closed_env.clone(); local.extend(caller_env)` had caller_env AFTER closed_env, so caller SHADOWED closed (dynamic scoping). A redefined variable `x` in caller_env would shadow the closure's `x`. Now closed_env correctly shadows original — proper lexical scoping.
 
 ## Known Pitfalls
 **Important notes**:
