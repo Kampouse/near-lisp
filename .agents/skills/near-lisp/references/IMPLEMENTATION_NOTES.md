@@ -25,16 +25,18 @@ Reference for modifying the near-lisp interpreter (Rust). Not needed for writing
 
 | Pattern | Iterations | Total Gas | Per-iter |
 |---------|-----------|-----------|----------|
-| 1-binding count `(loop ((i 0)) ...)` | 1,000 | 4.36 Tgas | 4.36 Ggas |
-| 1-binding count | 10,000 | 25.14 Tgas | 2.51 Ggas |
-| 1-binding count | 50,000 | 117.48 Tgas | 2.35 Ggas |
-| 1-binding count | 100,000 | 232.92 Tgas | 2.33 Ggas |
-| 2-binding count `(loop ((i 0) (sum 0)) ...)` | 10,000 | 35.02 Tgas | 3.50 Ggas |
-| 2-binding count | 100,000 | 301.20 Tgas | 3.01 Ggas |
-| Baseline (no loop, eval `"1"`) | — | 1.98 Tgas | — |
+| 1-binding count | 1,000 | 2.30 Tgas | 0.80 Ggas |
+| 1-binding count | 10,000 | 8.99 Tgas | 0.75 Ggas |
+| 1-binding count | 50,000 | 38.71 Tgas | 0.74 Ggas |
+| 1-binding count | 100,000 | 75.86 Tgas | 0.74 Ggas |
+| 2-binding count | 10,000 | 16.96 Tgas | 1.55 Ggas |
+| 2-binding count | 100,000 | 155.28 Tgas | 1.54 Ggas |
+| Baseline (no loop, eval `\"1\"`) | — | 1.50 Tgas | — |
 
-- **Max iterations at 300 Tgas**: 129,672 (1-binding, binary searched on-chain)
-- **Per-iteration cost** (amortized, converges at high N): ~2.3 Ggas/iter (1-binding), ~3.0 Ggas/iter (2-binding), ~0.7 Ggas marginal per extra binding
+- **Max iterations at 300 Tgas**: ~401K (1-binding), ~194K (2-binding) — binary searched on-chain
+- **Per-iteration cost** (marginal, converges at high N): ~0.74 Ggas/iter (1-binding), ~1.54 Ggas/iter (2-binding), ~0.79 Ggas marginal per extra binding
+- **Old tree-walk cost** (for comparison): ~22.45 Ggas/iter, max ~13,350 iterations
+- **Peephole optimizer** fuses LoadSlot + PushI64 + Arith/Cmp into single ops (SlotAddImm, SlotGeImm, etc.) and converts small Recur→RecurDirect. This provides ~3x improvement over non-fused bytecode. CRITICAL: jump targets must be remapped after fusion (see On-Chain Bugs section).
 - **Old tree-walk cost** (for comparison): ~22.45 Ggas/iter, max ~13,350 iterations
 - The internal gas limit should be set to 300T (`set_gas_limit(300000000000000)`) to match NEAR's receipt gas cap.
 - **On-chain gas benchmarking method**: `near` CLI truncates gas to 3 decimal Tgas — useless for precision. Use RPC `EXPERIMENTAL_tx_status` for exact gas: extract tx hash from CLI output, then `curl RPC -d '{"method":"EXPERIMENTAL_tx_status","params":["TX_HASH","ACCOUNT"]}'`, sum `transaction_ou
@@ -112,6 +114,8 @@ Runs 144 tests against the live testnet contract. Uses `near contract call-funct
 
 ## On-Chain Bugs — Status (2026-04)
 
+**FIXED — Peephole optimizer jump target remap**: `peephole_optimize()` fuses 3 ops (LoadSlot + PushI64 + Arith) into 1 fused op (e.g. SlotAddImm), shrinking the bytecode. But jump targets (JumpIfFalse, JumpIfTrue, Jump) were compiled against the original indices — after fusion they pointed past the end of the shorter optimized code, causing `index out of bounds` panics at runtime. Fix: build an `index_map: Vec<usize>` mapping old_pc → new_pc during fusion, then remap all jump targets in a second pass via `remap_jump_target()`. The `Recur`/`RecurDirect` ops don't need remapping since they always jump to pc=0 (loop start).
+
 **FIXED — `nil?` vs empty list**: `(nil? (list))` now returns `true`. The fix adds `LispVal::List(ref v) if v.is_empty()` as a second matches! arm (can't combine with Nil in one pattern due to Rust E0408 — variable not bound in all patterns). This fixes ALL recursive list functions that use `(nil? lst)` or `(empty? lst)` as base case.
 
 **FIXED — `match` now supports flat syntax**: `(match 42 _ 99)` now works alongside the original clause syntax `(match 42 (_ 99))`. Both `lisp_eval` and the CEK trampoline `Frame::MatchExpr` handler were updated to walk clauses with a `while i < clauses.len()` loop — if a clause is a List, use clause form and advance by 1; if it's a bare atom, treat it as flat pattern-result pair and advance by 2.
@@ -141,8 +145,6 @@ Runs 144 tests against the live testnet contract. Uses `near contract call-funct
 **NEW — defmacro system**: `(defmacro name (params) body)` defines macros — args are NOT evaluated before being passed to the macro body. `(macroexpand expr)` expands macros without evaluating. Supports `&rest` params. Macro expansion happens before special form dispatch in `lisp_eval`. Macros close over their definition env (like lambdas). Gas is passed through — macro expansion costs gas.
 
 **NEW — inspect builtin**: `(inspect x)` returns type+value description string for debugging.
-
-**NEW — Autonomous callback pattern**: `eval_async_with_callback(code, callback_account, callback_method)` and `eval_script_async_with_callback(name, callback_account, callback_method)` deliver computation results via cross-contract call instead of receipt return value. Enables one-call autonomous agents: caller fires one transaction, kampy handles the full eval (including multi-batch ccall yield/resume cycles), then dispatches the final result to `callback_account.callback_method(result_bytes)`. Internally, `CallbackInfo { account, method }` is stored in `VmState` and propagated through yield/resume cycles. When `RunResult::Done` is reached (either immediately or after resume), the callback Promise is fired. The callback receives the result string as raw bytes — the receiving contract parses it as needed. Gas: 50 Tgas allocated for the callback Promise.
 
 **NOT IMPLEMENTED — Bytes type**: `LispVal::Bytes(Vec<u8>)` and its 8 builtins (`hex->bytes`, `bytes-hex`, `bytes->hex`, `bytes-len`, `bytes->string`, `string->bytes`, `bytes-concat`, `bytes-slice`) are documented in the Language Reference section of SKILL.md but do NOT exist in the current code. 12 tests in `tests/lisp_coverage.rs` fail with `"undefined: hex->bytes"`. The `hex_decode`/`hex_encode` helpers DO exist in the codebase — just no `LispVal::Bytes` variant or dispatch_call handlers.
 
@@ -225,11 +227,12 @@ The following optimizations were applied to reduce on-chain gas cost:
 - Compilation is attempted at `loop` form entry in `lisp_eval` — if `try_compile_loop` returns `None`, falls back to existing tree-walk interpreter seamlessly.
 - Helper functions `num_val` (owned) and `num_val_ref` (&ref) for extracting i64 from LispVal in both VM (owned stack.pop) and tree-walk (borrowed) contexts.
 - **On-chain benchmarks** (kampy.testnet):
-  - 1-binding counting loop: ~2.3 Ggas/iter at scale (was ~22.45 Ggas/iter tree-walk)
-  - 2-binding counting loop: ~3.0 Ggas/iter at scale
-  - Marginal cost per extra binding: ~0.7 Ggas
-  - Max iterations at 300 Tgas: 129,672 (1-binding)
-  - Baseline (no loop): 1.98 Tgas
+  - 1-binding counting loop: ~0.74 Ggas/iter at scale (was ~22.45 Ggas/iter tree-walk)
+  - 2-binding counting loop: ~1.54 Ggas/iter at scale
+  - Marginal cost per extra binding: ~0.79 Ggas
+  - Max iterations at 300 Tgas: ~401K (1-binding), ~194K (2-binding)
+  - Baseline (no loop): 1.50 Tgas
+  - **Peephole optimizer** fuses LoadSlot+PushI64+Arith/Cmp into SlotAddImm etc. (~3x speedup over unfused bytecode). Must remap jump targets after fusion — see "peephole jump remap" in On-Chain Bugs.
 
 **P1 — loop/recur: push/pop instead of env clone** (tree-walk fallback):
 - Every loop iteration cloned the entire env. Now pushes bindings directly into env, evaluates body, then truncates (pops) the bindings. Zero allocation per iteration.

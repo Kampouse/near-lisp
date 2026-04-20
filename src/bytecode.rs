@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 
 use crate::helpers::is_truthy;
-use crate::types::{LispVal, Env};
+use crate::types::{check_gas, Env, LispVal};
 
 // ---------------------------------------------------------------------------
 // Loop Bytecode Compiler — tight VM for loop/recur
@@ -73,6 +73,27 @@ enum Op {
     Recur(usize),
     /// Call a builtin by name with N args from stack
     BuiltinCall(String, usize),
+    // --- Compound ops: fused LoadSlot(s) + PushI64(imm) + Arith/Cmp ---
+    /// Read slots[s] as i64, add imm, write back to slot AND push result
+    SlotAddImm(usize, i64),
+    /// Read slots[s] as i64, subtract imm, write back to slot AND push result
+    SlotSubImm(usize, i64),
+    /// Read slots[s] as i64, multiply by imm, push result
+    SlotMulImm(usize, i64),
+    /// Read slots[s] as i64, divide by imm, push result
+    SlotDivImm(usize, i64),
+    /// Read slots[s] as i64, compare with imm for equality, push bool
+    SlotEqImm(usize, i64),
+    /// Read slots[s] as i64, compare with imm (<), push bool
+    SlotLtImm(usize, i64),
+    /// Read slots[s] as i64, compare with imm (<=), push bool
+    SlotLeImm(usize, i64),
+    /// Read slots[s] as i64, compare with imm (>), push bool
+    SlotGtImm(usize, i64),
+    /// Read slots[s] as i64, compare with imm (>=), push bool
+    SlotGeImm(usize, i64),
+    /// Like Recur but for small N — no Vec allocation
+    RecurDirect(usize),
 }
 
 /// Compiled loop representation.
@@ -367,11 +388,13 @@ impl LoopCompiler {
                     self.code.push(Op::Return);
                 }
                 let captured = self.captured.clone();
+                let mut code = self.code;
+                peephole_optimize(&mut code);
                 return Some(CompiledLoop {
                     num_slots,
                     slot_names: self.slot_map,
                     init_vals,
-                    code: self.code,
+                    code,
                     loop_start_pc: 0,
                     captured,
                 });
@@ -379,16 +402,84 @@ impl LoopCompiler {
             if !self.compile_expr(body, outer_env) { return None; }
             self.code.push(Op::Return);
             let captured = self.captured.clone();
+            let mut code = self.code;
+            peephole_optimize(&mut code);
             return Some(CompiledLoop {
                 num_slots,
                 slot_names: self.slot_map,
                 init_vals,
-                code: self.code,
+                code,
                 loop_start_pc: 0,
                 captured,
             });
         }
         None
+    }
+}
+
+/// Peephole optimizer: fuse LoadSlot + PushI64 + Arith/Cmp sequences,
+/// convert small Recur → RecurDirect, and remap jump targets.
+fn peephole_optimize(code: &mut Vec<Op>) {
+    let mut i = 0;
+    let mut new_code = Vec::with_capacity(code.len());
+    // Build old_pc → new_pc mapping so jump targets stay valid
+    let mut index_map: Vec<usize> = Vec::with_capacity(code.len());
+    while i < code.len() {
+        index_map.push(new_code.len());
+        // Try to fuse LoadSlot(s) + PushI64(imm) + Arith/Cmp
+        if i + 2 < code.len() {
+            if let (Op::LoadSlot(s), Op::PushI64(imm)) = (&code[i], &code[i + 1]) {
+                let s = *s;
+                let imm = *imm;
+                let fused = match &code[i + 2] {
+                    Op::Add => Some(Op::SlotAddImm(s, imm)),
+                    Op::Sub => Some(Op::SlotSubImm(s, imm)),
+                    Op::Mul => Some(Op::SlotMulImm(s, imm)),
+                    Op::Div => Some(Op::SlotDivImm(s, imm)),
+                    Op::Eq => Some(Op::SlotEqImm(s, imm)),
+                    Op::Lt => Some(Op::SlotLtImm(s, imm)),
+                    Op::Le => Some(Op::SlotLeImm(s, imm)),
+                    Op::Gt => Some(Op::SlotGtImm(s, imm)),
+                    Op::Ge => Some(Op::SlotGeImm(s, imm)),
+                    _ => None,
+                };
+                if let Some(op) = fused {
+                    // Mark fused ops as mapping to the same new index
+                    index_map.push(new_code.len());
+                    index_map.push(new_code.len());
+                    new_code.push(op);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        // Convert Recur(n) with n <= 4 to RecurDirect(n)
+        if let Op::Recur(n) = &code[i] {
+            if *n <= 4 {
+                new_code.push(Op::RecurDirect(*n));
+                i += 1;
+                continue;
+            }
+        }
+        new_code.push(code[i].clone());
+        i += 1;
+    }
+    // Remap jump targets using the index map
+    for op in &mut new_code {
+        remap_jump_target(op, &index_map);
+    }
+    *code = new_code;
+}
+
+/// Remap a jump target from old PC to new PC using the index map.
+fn remap_jump_target(op: &mut Op, index_map: &[usize]) {
+    match op {
+        Op::JumpIfFalse(addr) | Op::JumpIfTrue(addr) | Op::Jump(addr) => {
+            if *addr < index_map.len() {
+                *addr = index_map[*addr];
+            }
+        }
+        _ => {}
     }
 }
 
@@ -409,12 +500,16 @@ fn run_compiled_loop(
     let mut pc: usize = 0;
 
     loop {
-        if *gas == 0 { return Err("out of gas".into()); }
-        *gas -= 1;
+        check_gas(gas)?;
 
         match &code[pc] {
             Op::LoadSlot(s) => {
-                stack.push(slots[*s].clone());
+                // Num fast path: avoid full Clone for the common case
+                let slot_ref = &slots[*s];
+                match slot_ref {
+                    LispVal::Num(n) => stack.push(LispVal::Num(*n)),
+                    _ => stack.push(slot_ref.clone()),
+                }
                 pc += 1;
             }
             Op::PushI64(n) => {
@@ -526,16 +621,69 @@ fn run_compiled_loop(
                 return Ok(stack.pop().unwrap_or(LispVal::Nil));
             }
             Op::Recur(n) => {
-                // Pop n args in reverse order into slots
-                let mut new_vals: Vec<LispVal> = Vec::with_capacity(*n);
-                for _ in 0..*n {
-                    new_vals.push(stack.pop().unwrap_or(LispVal::Nil));
-                }
-                new_vals.reverse();
-                for (i, v) in new_vals.into_iter().enumerate() {
-                    slots[i] = v;
+                // Direct reverse-order pop into slots — no Vec, no reverse
+                for i in (0..*n).rev() {
+                    slots[i] = stack.pop().unwrap_or(LispVal::Nil);
                 }
                 pc = 0; // jump to loop start
+            }
+            Op::RecurDirect(n) => {
+                // Same as Recur but guaranteed small N (no Vec allocation)
+                for i in (0..*n).rev() {
+                    slots[i] = stack.pop().unwrap_or(LispVal::Nil);
+                }
+                pc = 0; // jump to loop start
+            }
+            // --- Compound ops: fused LoadSlot + PushI64 + Arith/Cmp ---
+            Op::SlotAddImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                let result = v + imm;
+                slots[*s] = LispVal::Num(result);
+                stack.push(LispVal::Num(result));
+                pc += 1;
+            }
+            Op::SlotSubImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                let result = v - imm;
+                slots[*s] = LispVal::Num(result);
+                stack.push(LispVal::Num(result));
+                pc += 1;
+            }
+            Op::SlotMulImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v * imm));
+                pc += 1;
+            }
+            Op::SlotDivImm(s, imm) => {
+                if *imm == 0 { return Err("division by zero".into()); }
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v / imm));
+                pc += 1;
+            }
+            Op::SlotEqImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v == *imm));
+                pc += 1;
+            }
+            Op::SlotLtImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v < *imm));
+                pc += 1;
+            }
+            Op::SlotLeImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v <= *imm));
+                pc += 1;
+            }
+            Op::SlotGtImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v > *imm));
+                pc += 1;
+            }
+            Op::SlotGeImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v >= *imm));
+                pc += 1;
             }
             Op::BuiltinCall(name, n_args) => {
                 let mut args: Vec<LispVal> = Vec::with_capacity(*n_args);

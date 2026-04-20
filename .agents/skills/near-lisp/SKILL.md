@@ -19,6 +19,22 @@ description: On-chain Lisp interpreter for NEAR Protocol. Build, test, deploy, a
 
 GitHub: `Kampouse/near-lisp`
 
+## Source structure (7 modules)
+
+```
+src/
+├── lib.rs        — module declarations + re-exports (20 lines)
+├── types.rs      — LispVal, Env, constants, stdlib code (234 lines)
+├── parser.rs     — tokenize, parse, parse_all (137 lines)
+├── helpers.rs    — is_truthy, as_num, match_pattern, do_arith (333 lines)
+├── bytecode.rs   — Op, CompiledLoop, LoopCompiler, run_compiled_loop (665 lines)
+├── eval.rs       — lisp_eval, dispatch_call, apply_lambda (1309 lines)
+├── vm.rs         — VmState, RunResult, ccall machinery, run_program (541 lines)
+└── contract.rs   — #[near_bindgen] LispContract + impl (891 lines)
+```
+
+`apply_lambda` lives in eval.rs (not helpers.rs) to avoid circular dep (helpers→eval→helpers).
+
 ## Build & Deploy
 
 ```bash
@@ -35,6 +51,24 @@ make repl
 ```
 
 The Makefile uses `cargo near deploy --override-toolchain 1.86.0` which builds with the correct Rust version and deploys in one step. No manual toolchain switching needed.
+
+### Manual WASM build (if make unavailable)
+
+```bash
+# NEAR rejects WASM from rustc >= 1.87 (bulk-memory ops). Pin 1.86 for WASM:
+rustup override set 1.86.0
+cargo build --target wasm32-unknown-unknown --release
+wasm-opt -Oz --strip-debug --signext-lowering \
+  -o target/near/near_lisp.wasm \
+  target/wasm32-unknown-unknown/release/near_lisp.wasm
+rustup override unset
+
+# Deploy
+near contract deploy kampy.testnet use-file target/near/near_lisp.wasm \
+  without-init-call network-config testnet sign-with-legacy-keychain send
+```
+
+For tests: unset the override first (tests need rustc 1.88+ for dev-deps like time 0.3.47).
 
 ### On-chain calls via make
 
@@ -377,7 +411,7 @@ Pattern types: `_` (wildcard), `?name` (binding), numeric/string/bool literals, 
 (near/predecessor= "alice.near") ;; → bool
 ```
 
-#### Storage (100 gas per op, namespaced per caller)
+#### Storage (real NEAR gas, namespaced per caller)
 
 ```lisp
 (near/storage-write "key" "value")  ;; → true
@@ -525,7 +559,7 @@ All functions below are **native builtins** — no `require "list"` needed. They
 
 | Method | Type | Access | Description |
 |--------|------|--------|-------------|
-| `new(eval_gas_limit)` | init | private | Initialize contract (default gas limit: 10000) |
+| `new(eval_gas_limit)` | init | private | Initialize contract (default gas limit: 300 Tgas = 300000000000000) |
 | `eval(code)` → String | call | whitelist | Eval Lisp, return result |
 | `eval_with_input(code, input_json)` → String | call | whitelist | Eval with JSON vars injected |
 | `eval_async(code)` → String | payable | whitelist | Async eval with ccall yield/resume |
@@ -561,6 +595,17 @@ All functions below are **native builtins** — no `require "list"` needed. They
 | `resume_eval(yield_id)` → String | private | contract | Resume from yield |
 | `auto_resume_batch_ccall(data_id_hex)` → String | private | contract | Batch ccall callback |
 
+### Autonomous execution (callback pattern)
+
+One-call autonomous pipeline — no polling or orchestration needed.
+
+| Method | Type | Access | Description |
+|--------|------|--------|-------------|
+| `eval_async_with_callback(code, callback_account, callback_method)` → String | payable | whitelist | Run Lisp, deliver result to `callback_account.callback_method` |
+| `eval_script_async_with_callback(name, callback_account, callback_method)` → String | payable | whitelist | Same, but runs a stored script |
+
+**How it works**: Agent calls `eval_async_with_callback("(define price ...)", "agent.testnet", "on_result")`. kampy handles the full eval (including multi-batch ccall yield/resume cycles), then fires a cross-contract call to `agent.testnet.on_result(result_bytes)`. The callback receives the result string as raw bytes. 50 Tgas allocated for the callback Promise. If no ccalls are needed, callback fires immediately.
+
 
 ---
 
@@ -568,14 +613,32 @@ All functions below are **native builtins** — no `require "list"` needed. They
 
 See `references/GAS_REFERENCE.md` for detailed on-chain benchmarks.
 
-Quick reference (bytecode VM, 300 Tgas cap):
-- Pure compute loop: ~2.3 Ggas/iter, max ~130K iterations
+### Gas Accounting System
+
+The contract uses **real NEAR gas** for budget tracking, not a synthetic step counter.
+
+**How it works**: `check_gas()` (in `types.rs`) is feature-gated:
+- **WASM (on-chain)**: calls `env::used_gas().as_gas()` and compares against the budget minus a 2 Tgas buffer. This is 1:1 with actual NEAR gas consumption -- no calibration needed.
+- **Native (tests)**: decrements a synthetic `u64` counter by 1 per eval tick. This keeps tests simple without needing `used_gas()` mocks.
+
+The `eval_gas_limit` is stored as real NEAR gas units (e.g. `300_000_000_000_000` = 300 Tgas). Set via `set_gas_limit()`. Default: 300 Tgas.
+
+**Storage ops**: No separate gas accounting. NEAR charges real gas for `storage_read/write/remove` natively -- `check_gas()` at the eval loop level catches the total.
+
+**Old system** (removed): was a flat synthetic counter (`*gas -= 1` per eval call, separate `STORAGE_GAS_COST = 100` for storage ops). Replaced because it couldn't predict actual NEAR gas consumption.
+
+### Performance Reference (bytecode VM with peephole optimizer, 300 Tgas cap):
+
+- Pure compute loop (1-binding): ~0.74 Ggas/iter marginal, max ~401K iterations
+- Pure compute loop (2-binding): ~1.54 Ggas/iter marginal, max ~194K iterations
+- Extra binding cost: ~0.79 Ggas/iter
+- Baseline (eval overhead): ~1.50 Tgas
 - Reduce on list: ~4.3 Ggas/elem, max ~70K elements
 - Map on list: ~9.2 Ggas/elem, max ~32K elements
 - List creation: ~1.6 Ggas/elem, max ~190K elements
 - Sort: ~2.1 Ggas/elem (O(n log n))
-- Extra `if` in loop: +0.3 Ggas/iter (constant) to +0.8 Ggas/iter (with comparison)
-- Outer `if` around loop: ~0.02 Tgas flat (one-time)
+
+**IMPORTANT — Gas measurement on-chain**: The `near` CLI `Gas burned` line shows TRANSACTION-level gas (signing overhead), NOT execution gas. A 10K-iter loop shows "0.309 Tgas" in CLI but actually burns ~9 Tgas. Always use RPC `EXPERIMENTAL_tx_status` to get `receipts_outcome[].outcome.gas_burnt` for accurate numbers. Receipt[0] is the function execution, Receipt[1+] are overhead.
 
 ## Security Model
 

@@ -10,15 +10,31 @@ use std::collections::{BTreeMap, HashMap};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Gas cost for each storage operation (read/write/remove/has).
-pub const STORAGE_GAS_COST: u64 = 100;
+/// Gas budget for evaluation. In contract mode (WASM), this is real NEAR gas in gas units
+/// (1 Tgas = 10^12). In test mode (native), this is a synthetic counter decremented per eval tick.
+pub const DEFAULT_EVAL_GAS_LIMIT: u64 = 300_000_000_000_000; // 300 Tgas
 
-/// Helper: check and consume `cost` gas units. Returns Err if insufficient.
-pub fn consume_gas(gas: &mut u64, cost: u64, op: &str) -> Result<(), String> {
-    if *gas < cost {
-        return Err(format!("{}: out of gas (need {}, have {})", op, cost, *gas));
+/// Buffer reserved for function return / cleanup when checking real NEAR gas.
+const GAS_BUFFER: u64 = 2_000_000_000_000; // 2 Tgas
+
+/// Check if the gas budget has been exceeded.
+/// - Contract mode (WASM): compares `env::used_gas()` against budget + buffer
+/// - Test mode (native): decrements synthetic counter by 1
+#[inline]
+pub fn check_gas(gas: &mut u64) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if near_sdk::env::used_gas().as_gas() >= gas.saturating_sub(GAS_BUFFER) {
+            return Err("out of gas".into());
+        }
     }
-    *gas -= cost;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if *gas == 0 {
+            return Err("out of gas".into());
+        }
+        *gas -= 1;
+    }
     Ok(())
 }
 

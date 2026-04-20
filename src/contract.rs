@@ -6,7 +6,7 @@ use near_sdk::{
 use std::collections::{BTreeMap, HashMap};
 
 
-use crate::types::{LispVal, Env, STORAGE_GAS_COST, consume_gas, get_stdlib_code};
+use crate::types::{LispVal, Env, DEFAULT_EVAL_GAS_LIMIT, get_stdlib_code};
 use crate::helpers::*;
 use crate::parser::parse_all;
 use crate::eval::lisp_eval;
@@ -27,7 +27,7 @@ impl Default for LispContract {
     fn default() -> Self {
         Self {
             owner: env::signer_account_id(),
-            eval_gas_limit: 10_000,
+            eval_gas_limit: DEFAULT_EVAL_GAS_LIMIT,
             policy_names: IterableSet::new(b"p"),
             script_names: IterableSet::new(b"s"),
             module_names: IterableSet::new(b"m"),
@@ -43,7 +43,7 @@ impl LispContract {
         Self {
             owner: env::signer_account_id(),
             eval_gas_limit: if eval_gas_limit == 0 {
-                10_000
+                DEFAULT_EVAL_GAS_LIMIT
             } else {
                 eval_gas_limit
             },

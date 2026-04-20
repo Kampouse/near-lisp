@@ -10,7 +10,7 @@ mod vm;
 mod contract;
 
 // Re-exports
-pub use types::{LispVal, Env, STORAGE_GAS_COST, consume_gas, get_stdlib_code};
+pub use types::{LispVal, Env, DEFAULT_EVAL_GAS_LIMIT, check_gas, get_stdlib_code};
 pub use parser::parse_all;
 pub use eval::lisp_eval;
 pub use vm::{run_program, run_program_with_ccall, run_remaining_with_ccall, VmState, RunResult, CallbackInfo, CcallYield};

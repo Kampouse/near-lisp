@@ -6,7 +6,7 @@ use near_sdk::{
 use std::collections::{BTreeMap, HashMap};
 
 
-use crate::types::{LispVal, Env, STORAGE_GAS_COST, consume_gas, get_stdlib_code};
+use crate::types::{LispVal, Env, check_gas, get_stdlib_code};
 use crate::helpers::*;
 use crate::bytecode::{try_compile_loop, exec_compiled_loop};
 use crate::parser::parse_all;
@@ -25,10 +25,7 @@ pub fn lisp_eval(
     // Non-tail evaluations (args, conditions) still call lisp_eval recursively.
     let mut current_expr: LispVal = expr.clone();
     '_trampoline: loop {
-        if *gas == 0 {
-            return Err("out of gas".into());
-        }
-        *gas -= 1;
+        check_gas(gas)?;
 
         match &current_expr {
             LispVal::Nil
@@ -869,8 +866,8 @@ fn dispatch_call(
             }
 
             // --- Storage (namespaced by __storage_prefix__) ---
+            // Note: NEAR charges real gas for storage ops — no synthetic accounting needed.
             "near/storage-write" => {
-                consume_gas(gas, STORAGE_GAS_COST, "near/storage-write")?;
                 let raw_key = as_str(&args[0])?;
                 let val = as_str(&args[1])?;
                 let key = sandbox_key(&raw_key, env);
@@ -878,7 +875,6 @@ fn dispatch_call(
                 Ok(LispVal::Bool(true))
             }
             "near/storage-read" => {
-                consume_gas(gas, STORAGE_GAS_COST, "near/storage-read")?;
                 let raw_key = as_str(&args[0])?;
                 let key = sandbox_key(&raw_key, env);
                 Ok(env::storage_read(key.as_bytes())
@@ -886,14 +882,12 @@ fn dispatch_call(
                     .unwrap_or(LispVal::Nil))
             }
             "near/storage-remove" => {
-                consume_gas(gas, STORAGE_GAS_COST, "near/storage-remove")?;
                 let raw_key = as_str(&args[0])?;
                 let key = sandbox_key(&raw_key, env);
                 env::storage_remove(key.as_bytes());
                 Ok(LispVal::Bool(true))
             }
             "near/storage-has?" => {
-                consume_gas(gas, STORAGE_GAS_COST, "near/storage-has?")?;
                 let raw_key = as_str(&args[0])?;
                 let key = sandbox_key(&raw_key, env);
                 Ok(LispVal::Bool(env::storage_has_key(key.as_bytes())))
