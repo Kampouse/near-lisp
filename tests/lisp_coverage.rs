@@ -1,12 +1,12 @@
 use near_lisp::*;
 
 fn eval_str(code: &str) -> String {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code, &mut env, 10_000).unwrap_or_else(|e| format!("ERROR: {}", e))
 }
 
 fn eval_str_gas(code: &str, gas: u64) -> String {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code, &mut env, gas).unwrap_or_else(|e| format!("ERROR: {}", e))
 }
 
@@ -274,7 +274,7 @@ fn test_contract_eval_script_async_missing() {
 #[test]
 fn test_near_log_with_vm() {
     setup_test_vm();
-    let mut e = Vec::new();
+    let mut e = Env::new();
     let r = run_program(r#"(near/log "test message")"#, &mut e, 10_000);
     assert_eq!(r.unwrap(), "nil");
 }

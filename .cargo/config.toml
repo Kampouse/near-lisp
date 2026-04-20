@@ -2,3 +2,6 @@
 rustflags = [
     "-C", "target-feature=-bulk-memory,-reference-types",
 ]
+
+[env]
+# Force time crate MSRV compatibility

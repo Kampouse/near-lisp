@@ -1,7 +1,8 @@
+use near_lisp::Env;
 use near_lisp::*;
 
 fn eval(code: &str) -> String {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code, &mut env, 1_000_000).unwrap_or_else(|e| format!("ERROR: {}", e))
 }
 

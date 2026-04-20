@@ -1,7 +1,7 @@
-use near_lisp::{parse_all, run_program};
+use near_lisp::{parse_all, run_program, Env};
 
-fn make_env() -> Vec<(String, near_lisp::LispVal)> {
-    Vec::new()
+fn make_env() -> Env {
+    Env::new()
 }
 
 fn parse_file(path: &str) -> Result<(), String> {

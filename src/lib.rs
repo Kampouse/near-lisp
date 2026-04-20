@@ -3,7 +3,7 @@ use near_sdk::store::IterableSet;
 use near_sdk::{
     env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseResult,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,6 +73,101 @@ fn get_stdlib_code(name: &str) -> Option<&'static str> {
         "string" => Some(STDLIB_STRING),
         "crypto" => Some(STDLIB_CRYPTO),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment - Vec<(String, LispVal)> with HashMap index for O(1) lookups
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct Env {
+    bindings: Vec<(String, LispVal)>,
+    index: HashMap<String, usize>,
+}
+
+impl Env {
+    pub fn new() -> Self {
+        Env { bindings: Vec::new(), index: HashMap::new() }
+    }
+
+    /// Build an Env from a flat vec of bindings (used by tests + resume_eval).
+    /// Later entries shadow earlier ones for the same name.
+    pub fn from_vec(bindings: Vec<(String, LispVal)>) -> Self {
+        let mut index = HashMap::new();
+        for (i, (name, _)) in bindings.iter().enumerate() {
+            index.insert(name.clone(), i);
+        }
+        Env { bindings, index }
+    }
+
+    pub fn push(&mut self, name: String, val: LispVal) {
+        let idx = self.bindings.len();
+        self.bindings.push((name.clone(), val));
+        self.index.insert(name, idx);
+    }
+
+    /// O(1) lookup - returns the most recent binding for `name`.
+    pub fn get(&self, name: &str) -> Option<&LispVal> {
+        let idx = *self.index.get(name)?;
+        Some(&self.bindings[idx].1)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    pub fn len(&self) -> usize { self.bindings.len() }
+    #[allow(clippy::len_without_is_empty)]
+    pub fn is_empty(&self) -> bool { self.bindings.is_empty() }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        for i in (new_len..self.bindings.len()).rev() {
+            let name = &self.bindings[i].0;
+            if let Some(idx) = self.index.get(name) {
+                if *idx >= new_len {
+                    let mut found = false;
+                    for j in (0..new_len).rev() {
+                        if self.bindings[j].0 == *name {
+                            self.index.insert(name.clone(), j);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        self.index.remove(name);
+                    }
+                }
+            }
+        }
+        self.bindings.truncate(new_len);
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut LispVal> {
+        let idx = *self.index.get(name)?;
+        Some(&mut self.bindings[idx].1)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, LispVal)> {
+        self.bindings.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, (String, LispVal)> {
+        self.bindings.iter_mut()
+    }
+
+    pub fn into_bindings(self) -> Vec<(String, LispVal)> { self.bindings }
+
+    pub fn clear(&mut self) {
+        self.bindings.clear();
+        self.index.clear();
+    }
+}
+
+impl std::ops::Index<usize> for Env {
+    type Output = (String, LispVal);
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.bindings[index]
     }
 }
 
@@ -374,11 +469,9 @@ fn as_str(v: &LispVal) -> Result<String, String> {
 /// Prepend the storage sandbox prefix from the env (if any).
 /// Uses a fast reverse scan — `__storage_prefix__` is typically near the end
 /// (pushed early at setup), so `.rev().find()` is usually O(1).
-fn sandbox_key(raw_key: &str, env: &[(String, LispVal)]) -> String {
-    env.iter()
-        .rev()
-        .find(|(k, _)| k == "__storage_prefix__")
-        .and_then(|(_, v)| match v {
+fn sandbox_key(raw_key: &str, env: &Env) -> String {
+    env.get("__storage_prefix__")
+        .and_then(|v| match v {
             LispVal::Str(s) => Some(s.as_str()),
             _ => None,
         })
@@ -455,23 +548,23 @@ fn apply_lambda(
     body: &LispVal,
     closed_env: &Vec<(String, LispVal)>,
     args: &[LispVal],
-    caller_env: &mut Vec<(String, LispVal)>,
+    caller_env: &mut Env,
     gas: &mut u64,
 ) -> Result<LispVal, String> {
     let base_len = caller_env.len();
     // Push closed_env entries — positioned after original caller entries in the
     // vec, so .rev().find() finds them before originals (lexical shadowing).
     for (k, v) in closed_env {
-        caller_env.push((k.clone(), v.clone()));
+        caller_env.push(k.clone(), v.clone());
     }
     // Push params — these shadow everything.
     for (i, p) in params.iter().enumerate() {
-        caller_env.push((p.clone(), args.get(i).cloned().unwrap_or(LispVal::Nil)));
+        caller_env.push(p.clone(), args.get(i).cloned().unwrap_or(LispVal::Nil));
     }
     // Handle &rest: collect remaining args as list
     if let Some(rest_name) = rest_param {
         let rest_args: Vec<LispVal> = args.get(params.len()..).unwrap_or(&[]).to_vec();
-        caller_env.push((rest_name.clone(), LispVal::List(rest_args)));
+        caller_env.push(rest_name.clone(), LispVal::List(rest_args));
     }
     let result = lisp_eval(body, caller_env, gas);
     caller_env.truncate(base_len);
@@ -721,9 +814,9 @@ impl LoopCompiler {
     }
 
     /// Try to capture an unknown symbol from outer env. Returns true if captured.
-    fn try_capture(&mut self, name: &str, outer_env: &Vec<(String, LispVal)>) -> bool {
+    fn try_capture(&mut self, name: &str, outer_env: &Env) -> bool {
         if self.slot_of(name).is_some() { return true; }
-        if let Some((_, val)) = outer_env.iter().rev().find(|(k, _)| k == name) {
+        if let Some(val) = outer_env.get(name) {
             self.captured.push((name.to_string(), val.clone()));
             return true;
         }
@@ -731,7 +824,7 @@ impl LoopCompiler {
     }
 
     /// Try to compile an expression. Returns false if unsupported.
-    fn compile_expr(&mut self, expr: &LispVal, outer_env: &Vec<(String, LispVal)>) -> bool {
+    fn compile_expr(&mut self, expr: &LispVal, outer_env: &Env) -> bool {
         match expr {
             LispVal::Num(n) => { self.code.push(Op::PushI64(*n)); true }
             LispVal::Float(f) => { self.code.push(Op::PushFloat(*f)); true }
@@ -932,7 +1025,7 @@ impl LoopCompiler {
         mut self,
         init_vals: Vec<LispVal>,
         body: &LispVal,
-        outer_env: &Vec<(String, LispVal)>,
+        outer_env: &Env,
     ) -> Option<CompiledLoop> {
         let num_slots = self.slot_map.len();
 
@@ -1001,7 +1094,7 @@ impl LoopCompiler {
 fn run_compiled_loop(
     cl: &CompiledLoop,
     gas: &mut u64,
-    outer_env: &mut Vec<(String, LispVal)>,
+    outer_env: &mut Env,
 ) -> Result<LispVal, String> {
     // Slot-based env: binding slots + captured env slots, direct index access
     let mut slots: Vec<LispVal> = cl.init_vals.clone();
@@ -1254,7 +1347,7 @@ pub fn try_compile_loop(
     binding_names: &[String],
     binding_vals: Vec<LispVal>,
     body: &LispVal,
-    outer_env: &Vec<(String, LispVal)>,
+    outer_env: &Env,
 ) -> Option<CompiledLoop> {
     let compiler = LoopCompiler::new(binding_names.to_vec());
     compiler.compile_body(binding_vals, body, outer_env)
@@ -1264,7 +1357,7 @@ pub fn try_compile_loop(
 pub fn exec_compiled_loop(
     cl: &CompiledLoop,
     gas: &mut u64,
-    outer_env: &mut Vec<(String, LispVal)>,
+    outer_env: &mut Env,
 ) -> Result<LispVal, String> {
     run_compiled_loop(cl, gas, outer_env)
 }
@@ -1274,7 +1367,7 @@ pub fn exec_compiled_loop(
 
 pub fn lisp_eval(
     expr: &LispVal,
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
 ) -> Result<LispVal, String> {
     // Trampoline loop for TCO — tail positions rebind current_expr + continue.
@@ -1296,7 +1389,7 @@ pub fn lisp_eval(
             | LispVal::Map(_) => return Ok(current_expr.clone()),
             LispVal::Recur(_) => return Err("recur outside loop".into()),
             LispVal::Sym(name) => {
-                if let Some((_, v)) = env.iter().rev().find(|(k, _)| k == name) {
+                if let Some(v) = env.get(name) {
                     return Ok(v.clone());
                 }
                 if is_builtin_name(name) {
@@ -1318,7 +1411,7 @@ pub fn lisp_eval(
                                 Some(v) => lisp_eval(v, env, gas)?,
                                 None => LispVal::Nil,
                             };
-                            env.push((var, val));
+                            env.push(var, val);
                             return Ok(LispVal::Nil);
                         }
                         // TCO: if
@@ -1372,7 +1465,7 @@ pub fn lisp_eval(
                                     if pair.len() == 2 {
                                         if let LispVal::Sym(name) = &pair[0] {
                                             let val = lisp_eval(&pair[1], env, gas)?;
-                                            env.push((name.clone(), val));
+                                            env.push(name.clone(), val);
                                         }
                                     }
                                 }
@@ -1392,7 +1485,7 @@ pub fn lisp_eval(
                                 params,
                                 rest_param,
                                 body: Box::new(body.clone()),
-                                closed_env: Box::new(env.clone()),
+                                closed_env: Box::new(env.clone().into_bindings()),
                             });
                         }
                         // TCO: progn/begin
@@ -1465,7 +1558,7 @@ pub fn lisp_eval(
                                                 )
                                             }
                                         };
-                                        env.push((error_var, LispVal::Str(err_msg)));
+                                        env.push(error_var, LispVal::Str(err_msg));
                                         let base_len = env.len() - 1;
                                         let mut r = LispVal::Nil;
                                         for body_expr in &clause[2..] {
@@ -1502,7 +1595,7 @@ pub fn lisp_eval(
                                 Some((bindings, body)) => {
                                     let base_len = env.len();
                                     for (name, v) in bindings {
-                                        env.push((name, v));
+                                        env.push(name, v);
                                     }
                                     let result = lisp_eval(&body, env, gas);
                                     env.truncate(base_len);
@@ -1559,7 +1652,7 @@ pub fn lisp_eval(
                             let result = loop {
                                 let base_len = env.len();
                                 for (i, name) in binding_names.iter().enumerate() {
-                                    env.push((name.clone(), binding_vals[i].clone()));
+                                    env.push(name.clone(), binding_vals[i].clone());
                                 }
                                 let result = lisp_eval(body, env, gas);
                                 env.truncate(base_len);
@@ -1662,18 +1755,18 @@ pub fn lisp_eval(
                             };
                             let marker =
                                 format!("__stdlib_{}__{}", module_name, prefix.unwrap_or(""));
-                            if env.iter().any(|(k, _)| k == &marker) {
+                            if env.contains(&marker) {
                                 return Ok(LispVal::Nil);
                             }
                             if let Some(code) = get_stdlib_code(module_name) {
                                 if let Some(pfx) = prefix {
-                                    let mut module_env: Vec<(String, LispVal)> = vec![];
+                                    let mut module_env = Env::new();
                                     let module_exprs = parse_all(code)?;
                                     for expr in &module_exprs {
                                         lisp_eval(expr, &mut module_env, gas)?;
                                     }
-                                    for (k, v) in module_env {
-                                        env.push((format!("{}/{}", pfx, k), v));
+                                    for (k, v) in module_env.into_bindings() {
+                                        env.push(format!("{}/{}", pfx, k), v);
                                     }
                                 } else {
                                     let module_exprs = parse_all(code)?;
@@ -1681,7 +1774,7 @@ pub fn lisp_eval(
                                         lisp_eval(expr, env, gas)?;
                                     }
                                 }
-                                env.push((marker, LispVal::Bool(true)));
+                                env.push(marker, LispVal::Bool(true));
                                 return Ok(LispVal::Nil);
                             }
                             let storage_key = format!("module:{}", module_name);
@@ -1689,13 +1782,13 @@ pub fn lisp_eval(
                                 let code = String::from_utf8(bytes)
                                     .map_err(|_| "require: module has invalid utf8")?;
                                 if let Some(pfx) = prefix {
-                                    let mut module_env: Vec<(String, LispVal)> = vec![];
+                                    let mut module_env = Env::new();
                                     let module_exprs = parse_all(&code)?;
                                     for expr in &module_exprs {
                                         lisp_eval(expr, &mut module_env, gas)?;
                                     }
-                                    for (k, v) in module_env {
-                                        env.push((format!("{}/{}", pfx, k), v));
+                                    for (k, v) in module_env.into_bindings() {
+                                        env.push(format!("{}/{}", pfx, k), v);
                                     }
                                 } else {
                                     let module_exprs = parse_all(&code)?;
@@ -1703,7 +1796,7 @@ pub fn lisp_eval(
                                         lisp_eval(expr, env, gas)?;
                                     }
                                 }
-                                env.push((marker, LispVal::Bool(true)));
+                                env.push(marker, LispVal::Bool(true));
                                 return Ok(LispVal::Nil);
                             }
                             return Err(format!(
@@ -1727,7 +1820,7 @@ pub fn lisp_eval(
 
 fn dispatch_call(
     list: &[LispVal],
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
 ) -> Result<LispVal, String> {
     let head = &list[0];
@@ -2509,7 +2602,7 @@ fn dispatch_call(
 fn call_val(
     func: &LispVal,
     args: &[LispVal],
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
 ) -> Result<LispVal, String> {
     match func {
@@ -2540,7 +2633,7 @@ fn call_val(
 
 pub fn run_program(
     code: &str,
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas_limit: u64,
 ) -> Result<String, String> {
     let exprs = parse_all(code)?;
@@ -2605,7 +2698,7 @@ pub struct VmState {
     /// (after all pending ccalls complete).
     pub remaining: Vec<LispVal>,
     /// Accumulated environment bindings.
-    pub env: Vec<(String, LispVal)>,
+    pub env: Env,
     /// Gas remaining.
     pub gas: u64,
     /// Variable names for each pending ccall.
@@ -2613,6 +2706,17 @@ pub struct VmState {
     /// `Some("price")` for `(define price (near/ccall ...))`
     /// `None` for standalone `(near/ccall ...)`
     pub pending_vars: Vec<Option<String>>,
+    /// Optional callback for cross-contract result delivery.
+    /// When set, the final result is sent as a cross-contract call
+    /// instead of being returned as a receipt value.
+    pub callback: Option<CallbackInfo>,
+}
+
+/// Cross-contract callback info — persisted in VmState across yield cycles.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct CallbackInfo {
+    pub account: String,
+    pub method: String,
 }
 
 /// Result of running a program that may contain cross-contract calls.
@@ -2672,7 +2776,7 @@ enum CcallMode {
 /// `inner` is [func_sym, account, method, args_json, (deposit, gas)?]
 fn extract_ccall_info(
     inner: &[LispVal],
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
     pending_var: Option<String>,
 ) -> Result<Option<CcallInfo>, String> {
@@ -2756,7 +2860,7 @@ fn extract_ccall_info(
 ///   (near/ccall-call "account" "method" "args_json" "deposit_yocto" "gas_tgas")
 fn check_ccall(
     expr: &LispVal,
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
 ) -> Result<Option<CcallInfo>, String> {
     let list = match expr {
@@ -2781,16 +2885,104 @@ fn check_ccall(
     Ok(None)
 }
 
+/// Recursively walk an expression, replacing every `(near/ccall[-view|-call] ...)`
+/// sub-expression with a synthetic temp variable `__ccall_tmp_N__`.
+///
+/// Returns the rewritten expression and a list of `(temp_var_name, ccall_list)` pairs
+/// that should be prepended as `(define __ccall_tmp_N__ (near/ccall ...))` statements.
+///
+/// This lets the existing flat ccall scanner detect and batch ALL cross-contract calls,
+/// even when they're nested inside other expressions like:
+///   (dict/get (near/ccall "oracle" "get_data" "{}") "prices")
+fn lift_nested_ccalls(
+    expr: LispVal,
+    counter: &mut usize,
+    lifts: &mut Vec<(String, LispVal)>,
+) -> LispVal {
+    match expr {
+        LispVal::List(ref list) if !list.is_empty() => {
+            // Check if this list IS a ccall itself
+            if let Some(LispVal::Sym(func)) = list.first() {
+                if classify_ccall(func).is_some() {
+                    // This IS a ccall — replace with temp var
+                    let var_name = format!("__ccall_tmp_{}__", counter);
+                    *counter += 1;
+                    lifts.push((var_name.clone(), expr.clone()));
+                    return LispVal::Sym(var_name);
+                }
+                // Skip (define var body) — the body is a single expression that
+                // check_ccall Pattern 1 already handles when body is a ccall.
+                // We only need to recurse into non-define forms.
+                if func == "define" && list.len() == 3 {
+                    // Don't lift ccalls from inside the body of a define.
+                    // check_ccall handles (define var (near/ccall ...)) directly.
+                    // But we DO need to lift if the body contains ccalls nested
+                    // deeper — e.g. (define x (f (near/ccall ...) y)).
+                    // So recurse into the body, but NOT if the body IS a ccall.
+                    if let LispVal::List(body) = &list[2] {
+                        if let Some(LispVal::Sym(f)) = body.first() {
+                            if classify_ccall(f).is_some() {
+                                // Body IS a ccall — leave it alone for check_ccall
+                                return expr;
+                            }
+                        }
+                    }
+                }
+            }
+            // Not a ccall — recurse into children
+            let mut new_list = Vec::with_capacity(list.len());
+            for child in list.iter() {
+                new_list.push(lift_nested_ccalls(child.clone(), counter, lifts));
+            }
+            LispVal::List(new_list)
+        }
+        _ => expr, // atoms pass through unchanged
+    }
+}
+
+/// Pre-processing pass: walk all parsed expressions and hoist any nested
+/// `(near/ccall ...)` calls into synthetic top-level `(define __ccall_tmp_N__ ...)`
+/// statements. The original expressions are rewritten to reference the temp vars.
+///
+/// Example:
+///   (define prices (dict/get (near/ccall "oracle" "get_data" "{}") "prices"))
+/// becomes:
+///   (define __ccall_tmp_0__ (near/ccall "oracle" "get_data" "{}"))
+///   (define prices (dict/get __ccall_tmp_0__ "prices"))
+fn lift_all_ccalls(exprs: Vec<LispVal>) -> Vec<LispVal> {
+    let mut counter = 0usize;
+    let mut result = Vec::new();
+
+    for expr in exprs {
+        let mut lifts = Vec::new();
+        let rewritten = lift_nested_ccalls(expr, &mut counter, &mut lifts);
+
+        // Emit synthetic defines for each lifted ccall
+        for (var_name, ccall_expr) in lifts {
+            result.push(LispVal::List(vec![
+                LispVal::Sym("define".to_string()),
+                LispVal::Sym(var_name),
+                ccall_expr,
+            ]));
+        }
+
+        result.push(rewritten);
+    }
+
+    result
+}
+
 /// Run a program that may contain cross-contract calls.
 ///
 /// Loops: evaluates non-ccall expressions, then batch-scans for consecutive ccalls,
 /// and yields if found. Repeats until all expressions are consumed.
 pub fn run_program_with_ccall(
     code: &str,
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas_limit: u64,
 ) -> Result<RunResult, String> {
-    let exprs = parse_all(code)?;
+    let exprs_raw = parse_all(code)?;
+    let exprs = lift_all_ccalls(exprs_raw);
     let mut gas = gas_limit;
 
     let mut pos = 0;
@@ -2850,6 +3042,7 @@ pub fn run_program_with_ccall(
                 env: env.clone(),
                 gas,
                 pending_vars,
+                callback: None,
             },
         });
     }
@@ -2866,7 +3059,7 @@ pub fn run_program_with_ccall(
 /// and yields if found. Repeats until all expressions are consumed.
 pub fn run_remaining_with_ccall(
     exprs: &[LispVal],
-    env: &mut Vec<(String, LispVal)>,
+    env: &mut Env,
     gas: &mut u64,
 ) -> Result<RunResult, String> {
     let mut pos = 0;
@@ -2926,6 +3119,7 @@ pub fn run_remaining_with_ccall(
                 env: env.clone(),
                 gas: *gas,
                 pending_vars,
+                callback: None,
             },
         });
     }
@@ -3045,32 +3239,37 @@ impl LispContract {
 
     pub fn eval(&self, code: String) -> String {
         assert!(self.is_eval_allowed(), "Caller not allowed to eval");
-        let mut env = Vec::new();
-        env.push((
+        let mut env = Env::new();
+        env.push(
             "__storage_prefix__".to_string(),
             LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
-        ));
+        );
         run_program(&code, &mut env, self.eval_gas_limit)
             .unwrap_or_else(|e| format!("ERROR: {}", e))
     }
 
     pub fn eval_with_input(&self, code: String, input_json: String) -> String {
         assert!(self.is_eval_allowed(), "Caller not allowed to eval");
-        let mut env = Vec::new();
+        let mut env = Env::new();
         // Push user-supplied vars first so they cannot shadow the prefix
         if let Ok(map) =
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&input_json)
         {
-            for (k, v) in map {
-                env.push((k, json_to_lisp(v)));
+            for (k, v) in &map {
+                env.push(k.clone(), json_to_lisp(v.clone()));
             }
+            // Also expose full input as a dict (consistent with eval_async_with_input)
+            env.push(
+                "input".to_string(),
+                json_to_lisp(serde_json::Value::Object(map)),
+            );
         }
         // Push __storage_prefix__ AFTER input vars so it takes precedence and
         // cannot be overwritten by an attacker-controlled input_json.
-        env.push((
+        env.push(
             "__storage_prefix__".to_string(),
             LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
-        ));
+        );
         run_program(&code, &mut env, self.eval_gas_limit)
             .unwrap_or_else(|e| format!("ERROR: {}", e))
     }
@@ -3171,6 +3370,15 @@ impl LispContract {
     /// View: get a stored script by name
     pub fn get_script(&self, name: String) -> Option<String> {
         env::storage_read(format!("script:{}", name).as_bytes())
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+    }
+
+    /// View: read a key from eval-namespaced storage (caller-isolated).
+    /// Lets other contracts read cached data written by Lisp scripts.
+    /// Key is auto-prefixed with `eval:{caller}:`.
+    pub fn get_data(&self, key: String) -> Option<String> {
+        let storage_key = format!("eval:{}:{}", env::predecessor_account_id(), key);
+        env::storage_read(storage_key.as_bytes())
             .map(|b| String::from_utf8_lossy(&b).to_string())
     }
 
@@ -3293,6 +3501,54 @@ impl LispContract {
         }
     }
 
+    /// Async eval of a stored script with JSON input variables.
+    /// Combines `eval_script_async` (ccall/yield support) with `eval_with_input` (input injection).
+    /// Single-call pattern: no need to write params to storage first.
+    ///
+    /// Lisp code can reference `input` or any key from input_json directly:
+    ///   eval_script_async_with_input("oracle_query", r#"{"asset": "wrap.testnet"}"#)
+    ///   → script sees `(dict/get input "asset")` → "wrap.testnet"
+    pub fn eval_script_async_with_input(
+        &mut self,
+        name: String,
+        input_json: String,
+    ) -> String {
+        assert!(self.is_eval_allowed(), "Caller not allowed to eval");
+        match env::storage_read(format!("script:{}", name).as_bytes()) {
+            Some(bytes) => {
+                let code = String::from_utf8_lossy(&bytes).to_string();
+                let mut eval_env = Env::new();
+                // Inject user-supplied input vars (same as eval_with_input)
+                if let Ok(map) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&input_json)
+                {
+                    // Inject each key as a top-level var
+                    for (k, v) in &map {
+                        eval_env.push(k.clone(), json_to_lisp(v.clone()));
+                    }
+                    // Also expose the full input as a dict for convenience
+                    eval_env.push(
+                        "input".to_string(),
+                        json_to_lisp(serde_json::Value::Object(map)),
+                    );
+                }
+                // Push storage prefix AFTER input vars (cannot be overwritten)
+                eval_env.push(
+                    "__storage_prefix__".to_string(),
+                    LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
+                );
+                match run_program_with_ccall(&code, &mut eval_env, self.eval_gas_limit) {
+                    Ok(RunResult::Done(result)) => result,
+                    Ok(RunResult::Yield { yields, state }) => {
+                        Self::setup_batch_yield_chain(yields, state)
+                    }
+                    Err(e) => format!("ERROR: {}", e),
+                }
+            }
+            None => format!("ERROR: script '{}' not found", name),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Ownership
     // -----------------------------------------------------------------------
@@ -3337,11 +3593,102 @@ impl LispContract {
     ///   (near/ccall-result)  ;; returns the result on resume
     pub fn eval_async(&mut self, code: String) -> String {
         assert!(self.is_eval_allowed(), "Caller not allowed to eval");
-        let mut eval_env = Vec::new();
-        eval_env.push((
+        let mut eval_env = Env::new();
+        eval_env.push(
             "__storage_prefix__".to_string(),
             LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
-        ));
+        );
+        match run_program_with_ccall(&code, &mut eval_env, self.eval_gas_limit) {
+            Ok(RunResult::Done(result)) => result,
+            Ok(RunResult::Yield { yields, state }) => Self::setup_batch_yield_chain(yields, state),
+            Err(e) => format!("ERROR: {}", e),
+        }
+    }
+
+    /// Async eval with cross-contract callback.
+    ///
+    /// Like `eval_async`, but when the computation completes, the result is
+    /// delivered as a cross-contract function call to `callback_account.callback_method`
+    /// instead of being returned as a receipt value. This lets external contracts
+    /// receive Lisp computation results without polling.
+    ///
+    /// The callback receives the result string as its only argument (raw bytes).
+    ///
+    /// Example flow:
+    ///   1. Agent contract calls: eval_async_with_callback(
+    ///        "(define price (near/ccall \"ref.near\" \"get_price\" \"{}\")) (+ (to-num price) 10)",
+    ///        "agent.testnet",
+    ///        "on_result"
+    ///      )
+    ///   2. kampy runs eval, hits ccall → yields
+    ///   3. ccall completes → resume_eval fires → continues eval
+    ///   4. Final result: calls agent.testnet.on_result("42")
+    pub fn eval_async_with_callback(
+        &mut self,
+        code: String,
+        callback_account: String,
+        callback_method: String,
+    ) -> String {
+        assert!(self.is_eval_allowed(), "Caller not allowed to eval");
+        let mut eval_env = Env::new();
+        eval_env.push(
+            "__storage_prefix__".to_string(),
+            LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
+        );
+        match run_program_with_ccall(&code, &mut eval_env, self.eval_gas_limit) {
+            Ok(RunResult::Done(result)) => {
+                // No ccalls needed — fire callback immediately
+                let result_str = result.to_string();
+                env::log_str(&format!(
+                    "CALLBACK_IMMEDIATE: sending to {}.{}",
+                    callback_account, callback_method
+                ));
+                Promise::new(callback_account.parse().unwrap()).function_call(
+                    callback_method,
+                    result_str.clone().into_bytes(),
+                    NearToken::from_yoctonear(0),
+                    Gas::from_tgas(50),
+                );
+                result_str
+            }
+            Ok(RunResult::Yield {
+                yields,
+                mut state,
+            }) => {
+                // Store callback in VmState so resume_eval can fire it later
+                state.callback = Some(CallbackInfo {
+                    account: callback_account,
+                    method: callback_method,
+                });
+                Self::setup_batch_yield_chain(yields, state)
+            }
+            Err(e) => format!("ERROR: {}", e),
+        }
+    }
+
+    /// Async eval with input injection — combines eval_async (ccall/yield) with
+    /// eval_with_input (JSON input). Single call, no storage intermediary needed.
+    ///
+    /// Input keys become top-level vars AND are available via `(dict/get input "key")`.
+    pub fn eval_async_with_input(&mut self, code: String, input_json: String) -> String {
+        assert!(self.is_eval_allowed(), "Caller not allowed to eval");
+        let mut eval_env = Env::new();
+        if let Ok(map) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&input_json)
+        {
+            for (k, v) in &map {
+                eval_env.push(k.clone(), json_to_lisp(v.clone()));
+            }
+            eval_env.push(
+                "input".to_string(),
+                json_to_lisp(serde_json::Value::Object(map)),
+            );
+        }
+        // Push storage prefix AFTER input vars (cannot be overwritten)
+        eval_env.push(
+            "__storage_prefix__".to_string(),
+            LispVal::Str(format!("eval:{}:", env::predecessor_account_id())),
+        );
         match run_program_with_ccall(&code, &mut eval_env, self.eval_gas_limit) {
             Ok(RunResult::Done(result)) => result,
             Ok(RunResult::Yield { yields, state }) => Self::setup_batch_yield_chain(yields, state),
@@ -3372,16 +3719,17 @@ impl LispContract {
         let state: VmState =
             borsh::from_slice(&state_bytes).unwrap_or_else(|e| panic!("Corrupt VM state: {}", e));
 
+        // Preserve callback info before consuming state
+        let callback = state.callback.clone();
+
         // Read batch results from yield_resume payload
         // auto_resume_batch_ccall borsh-serializes Vec<Vec<u8>>
         // SDK 5.6.0: promise_result is deprecated but we can't use promise_result_checked
         // without bumping SDK (requires rustc 1.88+, WASM target pinned to 1.86.0).
         #[allow(deprecated)]
         let ccall_results: Vec<Vec<u8>> = match env::promise_result(0) {
-            PromiseResult::Successful(data) => {
-                borsh::from_slice(&data)
-                    .unwrap_or_else(|e| panic!("Failed to deserialize batch results: {}", e))
-            }
+            PromiseResult::Successful(data) => borsh::from_slice(&data)
+                .unwrap_or_else(|e| panic!("Failed to deserialize batch results: {}", e)),
             PromiseResult::Failed => {
                 env::storage_remove(yield_id.as_bytes());
                 return "ERROR: ccall batch failed".to_string();
@@ -3401,28 +3749,23 @@ impl LispContract {
 
             if let Some(Some(var)) = pending_var {
                 // (define var (near/ccall ...)) → inject result as the variable
-                eval_env.push((var.clone(), ccall_result_val.clone()));
+                eval_env.push(var.clone(), ccall_result_val.clone());
             } else {
                 // standalone (near/ccall ...) → inject as __ccall_result__
-                eval_env.push(("__ccall_result__".to_string(), ccall_result_val.clone()));
+                eval_env.push("__ccall_result__".to_string(), ccall_result_val.clone());
             }
 
             // Append result to accumulated __ccall_results__ list (for near/batch-result)
             {
-                let results_entry = eval_env
-                    .iter_mut()
-                    .rev()
-                    .find(|(k, _)| k == "__ccall_results__");
+                let results_entry = eval_env.get_mut("__ccall_results__");
                 match results_entry {
-                    Some((_, LispVal::List(ref mut vals))) => {
+                    Some(LispVal::List(ref mut vals)) => {
                         vals.push(ccall_result_val.clone());
                     }
-                    _ => {
-                        eval_env.push((
-                            "__ccall_results__".to_string(),
-                            LispVal::List(vec![ccall_result_val.clone()]),
-                        ));
-                    }
+                    _ => eval_env.push(
+                        "__ccall_results__".to_string(),
+                        LispVal::List(vec![ccall_result_val.clone()]),
+                    ),
                 }
             }
         }
@@ -3433,10 +3776,32 @@ impl LispContract {
         // Continue evaluating remaining expressions using ccall-aware runner
         let mut gas = state.gas;
         match run_remaining_with_ccall(&state.remaining, &mut eval_env, &mut gas) {
-            Ok(RunResult::Done(result)) => result,
-            Ok(RunResult::Yield { yields, state }) => {
+            Ok(RunResult::Done(result)) => {
+                // If a callback is registered, dispatch result via cross-contract call
+                if let Some(cb) = callback {
+                    let result_str = result.to_string();
+                    env::log_str(&format!(
+                        "CALLBACK: sending result to {}.{}",
+                        cb.account, cb.method
+                    ));
+                    Promise::new(cb.account.parse().unwrap()).function_call(
+                        cb.method,
+                        result_str.clone().into_bytes(),
+                        NearToken::from_yoctonear(0),
+                        Gas::from_tgas(50),
+                    );
+                    return result_str;
+                }
+                result
+            }
+            Ok(RunResult::Yield {
+                yields,
+                state: mut new_state,
+            }) => {
+                // Propagate callback through yield cycles
+                new_state.callback = callback;
                 // More ccalls found — set up another batch yield chain
-                Self::setup_batch_yield_chain(yields, state)
+                Self::setup_batch_yield_chain(yields, new_state)
             }
             Err(e) => format!("ERROR: {}", e),
         }
@@ -3524,7 +3889,7 @@ impl LispContract {
         let mut future_yield_cycles: u64 = 0;
         let mut future_ccall_count: u64 = 0;
         for expr in state.remaining.iter() {
-            let is_ccall = check_ccall(expr, &mut Vec::new(), &mut 10000u64)
+            let is_ccall = check_ccall(expr, &mut Env::new(), &mut 10000u64)
                 .map(|r| r.is_some())
                 .unwrap_or(false);
             if is_ccall {
@@ -3747,7 +4112,7 @@ mod tests {
     #[test]
     fn test_batch_result_no_results() {
         // near/batch-result should error when no __ccall_results__ in env
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 1000u64;
         let expr = LispVal::List(vec![LispVal::Sym("near/batch-result".into())]);
         let result = lisp_eval(&expr, &mut env, &mut gas);
@@ -3757,7 +4122,7 @@ mod tests {
     #[test]
     fn test_ccall_count_no_results() {
         // near/ccall-count should return 0 when no __ccall_results__ in env
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 1000u64;
         let expr = LispVal::List(vec![LispVal::Sym("near/ccall-count".into())]);
         let result = lisp_eval(&expr, &mut env, &mut gas);
@@ -3767,13 +4132,13 @@ mod tests {
     #[test]
     fn test_batch_result_with_results() {
         // near/batch-result should return the accumulated list
-        let mut env: Vec<(String, LispVal)> = vec![(
+        let mut env = Env::from_vec(vec![(
             "__ccall_results__".to_string(),
             LispVal::List(vec![
                 LispVal::Str("result1".into()),
                 LispVal::Str("result2".into()),
             ]),
-        )];
+        )]);
         let mut gas = 1000u64;
         let expr = LispVal::List(vec![LispVal::Sym("near/batch-result".into())]);
         let result = lisp_eval(&expr, &mut env, &mut gas);
@@ -3789,14 +4154,14 @@ mod tests {
     #[test]
     fn test_ccall_count_with_results() {
         // near/ccall-count should return the count of accumulated results
-        let mut env: Vec<(String, LispVal)> = vec![(
+        let mut env = Env::from_vec(vec![(
             "__ccall_results__".to_string(),
             LispVal::List(vec![
                 LispVal::Str("result1".into()),
                 LispVal::Str("result2".into()),
                 LispVal::Str("result3".into()),
             ]),
-        )];
+        )]);
         let mut gas = 1000u64;
         let expr = LispVal::List(vec![LispVal::Sym("near/ccall-count".into())]);
         let result = lisp_eval(&expr, &mut env, &mut gas);
@@ -3809,7 +4174,7 @@ mod tests {
 
     #[test]
     fn test_require_unknown_module() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 1000u64;
         let expr = parse_all("(require \"nonexistent\")").unwrap();
         let result = lisp_eval(&expr[0], &mut env, &mut gas);
@@ -3819,7 +4184,7 @@ mod tests {
 
     #[test]
     fn test_require_non_string() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 1000u64;
         let expr = parse_all("(require 42)").unwrap();
         let result = lisp_eval(&expr[0], &mut env, &mut gas);
@@ -3829,7 +4194,7 @@ mod tests {
 
     #[test]
     fn test_require_math_module() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 50000u64;
         // Load the math module
         let req = parse_all("(require \"math\")").unwrap();
@@ -3894,7 +4259,7 @@ mod tests {
 
     #[test]
     fn test_require_list_module() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 80000u64;
         let req = parse_all("(require \"list\")").unwrap();
         for e in &req {
@@ -4037,7 +4402,7 @@ mod tests {
 
     #[test]
     fn test_require_string_module() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 80000u64;
         let req = parse_all("(require \"string\")").unwrap();
         for e in &req {
@@ -4119,7 +4484,7 @@ mod tests {
 
     #[test]
     fn test_require_crypto_module() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let mut gas = 50000u64;
         let req = parse_all("(require \"crypto\")").unwrap();
         for e in &req {
@@ -4155,7 +4520,7 @@ mod tests {
     #[test]
     fn test_run_program_with_require() {
         // Test that require works through the run_program interface
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let result = run_program(
             "(require \"math\") (define x (abs -42)) x",
             &mut env,
@@ -4168,7 +4533,7 @@ mod tests {
     #[test]
     fn test_require_multiple_modules() {
         // Require both math and list, use functions from both
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let result = run_program(
             "(require \"math\") (require \"list\") (+ (abs -1) (abs -2))",
             &mut env,
@@ -4179,7 +4544,7 @@ mod tests {
 
     #[test]
     fn test_require_map_abs() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let result = run_program(
             "(require \"math\") (require \"list\") (map abs (list -1 -2 -3))",
             &mut env,
@@ -4193,7 +4558,7 @@ mod tests {
 
     #[test]
     fn test_require_reduce_sum() {
-        let mut env: Vec<(String, LispVal)> = vec![];
+        let mut env = Env::new();
         let result = run_program(
             "(require \"list\") (reduce (lambda (a b) (+ a b)) 0 (list 1 2 3))",
             &mut env,

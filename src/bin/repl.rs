@@ -31,7 +31,7 @@ fn count_open_parens(line: &str) -> i64 {
 }
 
 fn main() {
-    let mut env: Vec<(String, near_lisp::LispVal)> = Vec::new();
+    let mut env = near_lisp::Env::new();
     let mut gas_limit: u64 = 10_000_000;
     let mut input_buf = String::new();
 
@@ -88,7 +88,7 @@ fn main() {
                     if env.is_empty() {
                         println!("; environment is empty");
                     } else {
-                        for (k, v) in &env {
+                        for (k, v) in env.iter() {
                             println!("  {} = {}", k, v);
                         }
                     }

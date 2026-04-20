@@ -158,7 +158,7 @@ fn test_fuzz_evaluator_no_panics() {
 
     for code in eval_cases {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut env = Vec::new();
+            let mut env = Env::new();
             let _ = run_program(code, &mut env, 100_000);
         }));
         assert!(result.is_ok(), "Evaluator panicked on: {:?}", code);
@@ -167,7 +167,7 @@ fn test_fuzz_evaluator_no_panics() {
 
 #[test]
 fn test_arithmetic_commutativity() {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let pairs: Vec<(i64, i64)> = vec![
         (0, 0),
         (0, 1),
@@ -199,7 +199,7 @@ fn test_arithmetic_commutativity() {
 
 #[test]
 fn test_arithmetic_identity() {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let values: Vec<i64> = vec![0, 1, 42, -1, 100, -999, 999999];
 
     for v in values {
@@ -217,7 +217,7 @@ fn test_arithmetic_identity() {
 
 #[test]
 fn test_arithmetic_associativity() {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let triples: Vec<(i64, i64, i64)> = vec![(1, 2, 3), (0, 0, 0), (5, -3, 1), (10, 20, 30)];
 
     for (a, b, c) in triples {
@@ -235,7 +235,7 @@ fn test_arithmetic_associativity() {
 
 #[test]
 fn test_boolean_invariants() {
-    let mut env = Vec::new();
+    let mut env = Env::new();
 
     // not(not(x)) = x
     for val in &["true", "false"] {

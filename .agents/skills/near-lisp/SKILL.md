@@ -542,6 +542,8 @@ All functions below are **native builtins** — no `require "list"` needed. They
 | `eval_script(name)` → String | call | whitelist | Eval stored script |
 | `eval_script_with_input(name, input_json)` → String | call | whitelist | Eval with input |
 | `eval_script_async(name)` → String | payable | whitelist | Async eval with ccall |
+| `eval_script_async_with_input(name, input_json)` → String | payable | whitelist | Async eval stored script + input + ccall (single call, no storage intermediary) |
+| `eval_async_with_input(code, input_json)` → String | payable | whitelist | Async eval inline code + input + ccall (single call) |
 | `save_module(name, code)` | payable | owner | Store custom module |
 | `get_module(name)` → Option\<String\> | view | all | Retrieve module |
 | `list_modules()` → Vec\<String\> | view | all | List module names |
@@ -549,6 +551,7 @@ All functions below are **native builtins** — no `require "list"` needed. They
 | `set_gas_limit(limit)` | call | owner | Update eval gas limit |
 | `get_gas_limit()` → u64 | view | all | Current gas limit |
 | `get_owner()` → AccountId | view | all | Contract owner |
+| `get_data(key)` → Option\<String\> | view | all | Read eval-namespaced storage (caller-isolated). Key auto-prefixed `eval:{caller}:`. |
 | `transfer_ownership(new_owner)` | call | owner | Transfer ownership |
 | `add_to_eval_whitelist(account)` | call | owner | Whitelist account |
 | `remove_from_eval_whitelist(account)` | call | owner | Remove from whitelist |
@@ -615,16 +618,170 @@ Quick reference (bytecode VM, 300 Tgas cap):
   (catch e (near/log (str-concat "error: " e))))
 ```
 
+### Oracle Integration Pattern (on-chain)
+
+Composable pattern: fetch data from an oracle → parse → store → expose via `get_data()` view.
+
+**Option A: eval_async_with_input (single call, inline code)**
+```bash
+# One call — code + input + async ccalls
+ARGS=$(python3 -c "import json,base64; print(base64.b64encode(json.dumps({
+  'code': '(define owner (near/ccall \"priceoracle.testnet\" \"get_owner_id\" \"{}\")) (define pd (near/ccall \"priceoracle.testnet\" \"get_price_data\" \"{}\")) (near/storage-write \"oracle_owner\" owner) (dict \"owner\" owner \"assets\" (len (dict/get pd \"prices\")))',
+  'input_json': json.dumps({'asset': 'wrap.testnet'})
+}).encode()).decode())")
+near call kampy.testnet eval_async_with_input "$ARGS" --base64 --gas 300Tgas ...
+```
+
+**Option B: eval_script_async_with_input (single call, stored script)**
+```bash
+# One-time: save the script
+near call kampy.testnet save_script '{"name":"oracle_query","code":"..."}' --base64 ...
+
+# Then: single call with input
+ARGS=$(python3 -c "import json,base64; print(base64.b64encode(json.dumps({
+  'name': 'oracle_query',
+  'input_json': json.dumps({'asset': 'wrap.testnet'})
+}).encode()).decode())")
+near call kampy.testnet eval_script_async_with_input "$ARGS" --base64 --gas 300Tgas ...
+```
+
+**Read cached data** (any contract, synchronous view call):
+```bash
+near call kampy.testnet get_data '{"key":"oracle_owner"}' --base64 ...
+# → "priceoracle.testnet"
+```
+
+### Near CLI v0.24+ (cargo-near)
+
+```bash
+# Passing args — use base64 to avoid shell escaping hell:
+ARGS_B64=$(echo '{"code":"(+ 1 2)"}' | base64)
+near call kampy.testnet eval $ARGS_B64 --base64 --use-account kampy.testnet --network-id testnet
+
+# View call:
+near call kampy.testnet get_data $ARGS_B64 --base64 --use-account kampy.testnet --network-id testnet
+
+# Mutable call with gas:
+near call kampy.testnet eval_script_async $ARGS_B64 --base64 \
+  --gas 300000000000000 --use-account kampy.testnet --network-id testnet
+
+# NO: --args, --argsFile, stdin piping — not supported in v0.24+
+# YES: positional arg + --base64 flag
+
+# Reading async results (CLI shows "YIELDING", actual data in receipts):
+curl -s -X POST https://rpc.testnet.near.org -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"EXPERIMENTAL_tx_status","params":["TX_HASH","kampy.testnet"]}'
+# Receipt 0 = "YIELDING", Receipt 3 = oracle response, Receipt 1 = resume result
+```
+
+## Near CLI (0.24+) Arg Passing
+
+The new `near` CLI (0.24+) does NOT support `--args` or `--argsFile`. For JSON args with embedded quotes (ccalls, strings), use base64:
+
+```bash
+# Python helper to build args
+ARGS_B64=$(python3 -c "import json,base64; print(base64.b64encode(json.dumps({'code': '(near/ccall \"oracle.testnet\" \"get_price\" \"{}\")'}).encode()).decode())")
+
+# Call with --base64 flag
+near call kampy.testnet eval_async "$ARGS_B64" --base64 \
+    --gas 300000000000000 --use-account kampy.testnet --network-id testnet
+```
+
+For `eval_async` / `eval_script_async` with complex code, write args JSON to `/tmp/call.json` and use the long-form:
+```bash
+near contract call-function as-transaction kampy.testnet eval_async \
+    base64-args "$ARGS_B64" prepaid-gas '300 Tgas' attached-deposit '0 NEAR' \
+    sign-as kampy.testnet network-config testnet sign-with-keychain send
+```
+
+## Async Script Patterns
+
+### Pattern 1: eval_async_with_input (inline code + input, single call)
+
+Best for one-off queries. Passes input JSON directly, supports ccalls. No script storage needed.
+
+```bash
+# Single call — code + input + async ccalls
+near call kampy.testnet eval_async_with_input "$ARGS_B64" --base64 \
+    --gas 300000000000000 --use-account kampy.testnet --network-id testnet
+```
+
+Script sees input keys as top-level vars AND as `(dict/get input "key")`:
+```lisp
+(define target (dict/get input "asset"))
+(define price-data (near/ccall "priceoracle.testnet" "get_price_data" "{}"))
+(near/log (str-concat "Query: " target))
+(dict "price" price-data "target" target)
+```
+
+### Pattern 2: eval_script_async_with_input (stored script + input, single call)
+
+Best for reusable scripts. Script stored on-chain, input passed inline. No storage intermediary.
+
+```bash
+near call kampy.testnet eval_script_async_with_input '{"name":"oracle_query","input_json":"{\"asset\":\"wrap.testnet\"}"}' --base64 \
+    --gas 300000000000000 --use-account kampy.testnet --network-id testnet
+```
+
+### Pattern 3: eval_script_async + storage params (legacy, 2 calls)
+
+Use only when input is already in storage. Requires writing params to storage first, then running the script.
+
+```bash
+# Step 1: write param
+near call kampy.testnet eval '(near/storage-write "target" "wrap.testnet")' ...
+# Step 2: run script
+near call kampy.testnet eval_script_async '{"name":"oracle_query"}' --gas 300Tgas ...
+```
+
+### Pattern 4: get_data (read cached results, view call)
+
+After any async script stores results via `near/storage-write`, any contract can read them synchronously:
+
+```bash
+near call kampy.testnet get_data '{"key":"oracle_owner"}' --base64 --use-account kampy.testnet --network-id testnet
+# → "priceoracle.testnet"
+```
+
+**Key constraints:**
+- `near/ccall` can appear at any nesting depth. A pre-processing lift pass (`lift_all_ccalls`) automatically hoists nested ccalls like `(dict/get (near/ccall ...) "key")` into synthetic `(define __ccall_tmp_N__ (near/ccall ...))` statements that the batch scanner understands. The original expression is rewritten to reference the temp var. This works for arbitrary depth: `(str-concat "x=" (to-string (near/ccall ...)))`, `(dict/get (near/ccall ...) "prices")`, etc.
+- Flat patterns `(define var (near/ccall ...))` are left untouched by the lift pass — the batch scanner handles them directly, preserving n=N batching.
+- `eval_script_with_input` is synchronous and CANNOT do ccalls (no yield/resume) — use `eval_script_async_with_input` instead
+- `require` with lambda-heavy modules burns significant gas — inline helpers for scripts with ccalls
+- `(define (foo/bar x) body)` shorthand FAILS with `/` in names — use `(define foo/bar (lambda (x) body))`
+- Gas budget: 300 Tgas recommended for scripts with 2+ ccalls + post-processing
+- Async methods return "YIELDING" to caller — actual result is in the receipt. Use `get_data()` for contract-to-contract reads, or parse receipts off-chain.
+
+## Known Oracle Contracts (testnet)
+
+| Contract | Method | Returns |
+|----------|--------|---------|
+| `priceoracle.testnet` | `get_owner_id` | `"priceoracle.testnet"` |
+| `priceoracle.testnet` | `get_price_data` | `{timestamp, recency_duration_sec, prices: [{asset_id, price}]}` |
+| `priceoracle.testnet` | `get_assets` | `[[asset_id, {reports: [...]}], ...]` |
+| `pyth-oracle.testnet` | `price_feed_exists` | Exists but non-standard arg format (deserialization fails) |
+
+NearDefi oracle prices are all stale on testnet (last reports from 2022-2023). The same contract on mainnet (`priceoracle.near`) also stale.
+
 ## Known Pitfalls
 
-- `(define (f x) body)` shorthand desugars to `(define f (lambda (x) body))`
+- `(define (f x) body)` shorthand desugars to `(define f (lambda (x) body))` — BUT this shorthand FAILS if the name contains `/` (e.g. `(define (oracle/get x) ...)` → "define: need symbol"). Use the long form: `(define oracle/get (lambda (x) ...))`
 - `'expr` quote shorthand works — `'foo` → `(quote foo)`, `'(1 2 3)` → `(quote (1 2 3))`
 - `(loop for i in list sum i)` NOT valid — only Clojure-style `(loop (bindings) body)` with `(recur ...)`
 - Integer division with two ints: `(/ 10 3)` → `3` (truncated), not `3.333...`
 - `require` is idempotent — safe to call multiple times for the same module
 - Storage keys are auto-prefixed per caller — you can't access another caller's storage
-- Cross-contract calls require `eval_async` or `eval_script_async`, not regular `eval`
+- Cross-contract calls require `eval_async`, `eval_async_with_input`, `eval_script_async`, or `eval_script_async_with_input` — not regular `eval`/`eval_with_input`/`eval_script_with_input`
+- Nested ccalls like `(dict/get (near/ccall ...) "key")` are auto-lifted by `lift_all_ccalls` — no manual restructuring needed. The lift pass runs after parsing, before the batch scanner.
+- `eval_script_async` does NOT accept `input_json` — use `eval_script_async_with_input` or `eval_async_with_input` for single-call patterns with input
+- `eval_with_input` injects input keys as top-level vars AND as `input` dict — consistent with `eval_async_with_input`. Input is always available via `(dict/get input "key")`.
+- `eval_script_with_input` is synchronous — CANNOT do ccalls (no yield/resume). Use `eval_script_async_with_input` instead
+- `(define (foo/bar x) body)` shorthand fails with `/` in names — use `(define foo/bar (lambda (x) body))`
+- `require` with lambda-heavy modules (map/filter/filter) burns significant gas in scripts — inline helpers for ccall scripts
+- Gas: scripts with 2+ ccalls + post-processing need ~300 Tgas. The `require` module overhead can push it over 150 Tgas.
 - `loop/recur` is the ONLY iteration pattern with zero stack growth. Recursive lambdas overflow at ~100-200 depth.
+- Rust borrow checker: when injecting JSON input into env, iterate `&map` (borrow) not `map` (move) if you need the map again afterwards
+- **Testnet integration testing**: `near` CLI v0.24+ returns values as JSON after "Function execution return value" line. Parse with regex `r'return value.*?:\n(.+?)(?:\n\n)'`. Values are double-encoded (outer JSON string → inner value). For async ccalls: extract tx hash from output → sleep 4-5s → RPC `EXPERIMENTAL_tx_status` → iterate `receipts_outcome` → base64 decode `SuccessValue`. Receipt order: [0]=yield setup, [1]=resume result, [N]=ccall targets.
 
 ## Implementation & Testing
 

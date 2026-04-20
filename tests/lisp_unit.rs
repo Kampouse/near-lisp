@@ -1,12 +1,12 @@
 use near_lisp::*;
 
 fn eval_str(code: &str) -> String {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code, &mut env, 10_000).unwrap_or_else(|e| format!("ERROR: {}", e))
 }
 
 fn eval_str_gas(code: &str, gas: u64) -> String {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code, &mut env, gas).unwrap_or_else(|e| format!("ERROR: {}", e))
 }
 
@@ -166,7 +166,7 @@ fn test_closures() {
 
 #[test]
 fn test_gas_limit() {
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define fib (lambda (n)
             (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))))
@@ -181,10 +181,10 @@ fn test_gas_limit() {
 fn test_policy_pass() {
     let policy = r#"(and (>= score 85) (<= duration 3600) (str-contains status "complete"))"#;
     let input = r#"{"score": 90, "duration": 1200, "status": "complete"}"#;
-    let mut env: Vec<(String, LispVal)> = Vec::new();
+    let mut env = Env::new();
     if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(input) {
         for (key, val) in map {
-            env.push((key, json_to_lisp(val)));
+            env.push(key, json_to_lisp(val));
         }
     }
     assert_eq!(run_program(policy, &mut env, 10_000).unwrap(), "true");
@@ -194,10 +194,10 @@ fn test_policy_pass() {
 fn test_policy_fail() {
     let policy = r#"(and (>= score 85) (<= duration 3600) (str-contains status "complete"))"#;
     let input = r#"{"score": 70, "duration": 1200, "status": "complete"}"#;
-    let mut env: Vec<(String, LispVal)> = Vec::new();
+    let mut env = Env::new();
     if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(input) {
         for (key, val) in map {
-            env.push((key, json_to_lisp(val)));
+            env.push(key, json_to_lisp(val));
         }
     }
     assert_eq!(run_program(policy, &mut env, 10_000).unwrap(), "false");
@@ -216,10 +216,10 @@ fn test_complex_policy() {
                     (str-contains status "partial"))))
     "#;
     let input = r#"{"score": 92, "duration": 3000, "status": "partial success"}"#;
-    let mut env: Vec<(String, LispVal)> = Vec::new();
+    let mut env = Env::new();
     if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(input) {
         for (key, val) in map {
-            env.push((key, json_to_lisp(val)));
+            env.push(key, json_to_lisp(val));
         }
     }
     assert_eq!(run_program(policy, &mut env, 10_000).unwrap(), "true");
@@ -238,10 +238,10 @@ fn test_vmstate_roundtrip() {
             LispVal::Num(1),
             LispVal::Num(2),
         ])],
-        env: vec![
+        env: Env::from_vec(vec![
             ("x".to_string(), LispVal::Num(42)),
             ("name".to_string(), LispVal::Str("test".into())),
-        ],
+        ]),
         gas: 9500,
         pending_vars: vec![Some("price".to_string())],
     };
@@ -263,7 +263,7 @@ fn test_vmstate_complex_env() {
     // Test with lambda closures in the env (most complex LispVal variant)
     let state = VmState {
         remaining: vec![],
-        env: vec![(
+        env: Env::from_vec(vec![(
             "fib".to_string(),
             LispVal::Lambda {
                 params: vec!["n".into()],
@@ -298,7 +298,7 @@ fn test_vmstate_complex_env() {
                 rest_param: None,
                 closed_env: Box::new(vec![]),
             },
-        )],
+        )]),
         gas: 50000,
         pending_vars: vec![],
     };
@@ -312,7 +312,7 @@ fn test_vmstate_complex_env() {
 #[test]
 fn test_run_program_no_ccall() {
     // run_program_with_ccall returns Done when no ccall is present
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let result = run_program_with_ccall("(+ 1 2)", &mut env, 10_000).unwrap();
     match result {
         RunResult::Done(s) => assert_eq!(s, "3"),
@@ -324,7 +324,7 @@ fn test_run_program_no_ccall() {
 fn test_run_program_ccall_define_pattern() {
     // (define price (near/ccall "ref.near" "get_price" "{}"))
     // Should yield with pending_vars = [Some("price")]
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define x 42)
         (define price (near/ccall "ref.near" "get_price" "{}"))
@@ -352,7 +352,7 @@ fn test_run_program_ccall_define_pattern() {
 #[test]
 fn test_run_program_ccall_standalone_pattern() {
     // (near/ccall "ref.near" "get_price" "{}") standalone
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (near/ccall "oracle.near" "latest" "{}")
         (near/ccall-result)
@@ -373,7 +373,7 @@ fn test_run_program_ccall_standalone_pattern() {
 #[test]
 fn test_run_program_multiple_top_level_only_first_ccall_yields() {
     // Two consecutive ccalls are now BATCHED into one yield
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define a (near/ccall "x.near" "f" "{}"))
         (define b (near/ccall "y.near" "g" "{}"))
@@ -399,7 +399,7 @@ fn test_run_program_multiple_top_level_only_first_ccall_yields() {
 #[test]
 fn test_run_remaining_with_ccall_no_ccall() {
     // run_remaining_with_ccall returns Done when no ccall in remaining
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let exprs = parse_all("(+ 1 2) (* 3 4)").unwrap();
     let mut gas = 10_000u64;
     let result = run_remaining_with_ccall(&exprs, &mut env, &mut gas).unwrap();
@@ -444,7 +444,7 @@ fn test_run_remaining_with_ccall_yields_on_first_ccall() {
 fn test_multi_ccall_two_ccalls_yield_chain() {
     // Two consecutive ccalls are BATCHED into a single yield.
     // With batching: both ccalls yield together, resume injects both results.
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define a (near/ccall "x.near" "f" "{}"))
         (define b (near/ccall "y.near" "g" "{}"))
@@ -472,8 +472,8 @@ fn test_multi_ccall_two_ccalls_yield_chain() {
 
     // Resume: inject both results, evaluate remaining
     let mut env2 = state.env.clone();
-    env2.push(("a".to_string(), LispVal::Str("result_a".to_string())));
-    env2.push(("b".to_string(), LispVal::Str("result_b".to_string())));
+    env2.push("a".to_string(), LispVal::Str("result_a".to_string()));
+    env2.push("b".to_string(), LispVal::Str("result_b".to_string()));
     let mut gas2 = state.gas;
     let result2 = run_remaining_with_ccall(&state.remaining, &mut env2, &mut gas2).unwrap();
 
@@ -489,7 +489,7 @@ fn test_multi_ccall_two_ccalls_yield_chain() {
 fn test_multi_ccall_env_accumulates_across_yields() {
     // Verify env bindings accumulate correctly with batched ccalls
     // When a non-ccall expression sits between two ccalls, they're in separate batches
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define x 100)
         (define a (near/ccall "alpha.near" "f1" "{}"))
@@ -516,7 +516,7 @@ fn test_multi_ccall_env_accumulates_across_yields() {
 
     // Resume 1: inject a, then y=200 is defined, then second ccall yields
     let mut env2 = state1.env.clone();
-    env2.push(("a".to_string(), LispVal::Str("alpha_result".to_string())));
+    env2.push("a".to_string(), LispVal::Str("alpha_result".to_string()));
     let mut gas2 = state1.gas;
     let result2 = run_remaining_with_ccall(&state1.remaining, &mut env2, &mut gas2).unwrap();
     let state2 = match result2 {
@@ -540,7 +540,7 @@ fn test_multi_ccall_env_accumulates_across_yields() {
 
     // Resume 2: inject b, then (+ x y) evaluates
     let mut env3 = state2.env.clone();
-    env3.push(("b".to_string(), LispVal::Str("beta_result".to_string())));
+    env3.push("b".to_string(), LispVal::Str("beta_result".to_string()));
     let mut gas3 = state2.gas;
     let result3 = run_remaining_with_ccall(&state2.remaining, &mut env3, &mut gas3).unwrap();
     match result3 {
@@ -554,7 +554,7 @@ fn test_multi_ccall_env_accumulates_across_yields() {
 #[test]
 fn test_multi_ccall_standalone_ccall_chain() {
     // Standalone ccalls separated by (near/ccall-result) — non-ccall breaks batch
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (near/ccall "oracle.near" "get1" "{}")
         (near/ccall-result)
@@ -579,10 +579,10 @@ fn test_multi_ccall_standalone_ccall_chain() {
 
     // Resume: inject __ccall_result__, evaluate (near/ccall-result), then second ccall yields
     let mut env2 = state1.env.clone();
-    env2.push((
+    env2.push(
         "__ccall_result__".to_string(),
         LispVal::Str("first_result".to_string()),
-    ));
+    );
     let mut gas2 = state1.gas;
     let result2 = run_remaining_with_ccall(&state1.remaining, &mut env2, &mut gas2).unwrap();
 
@@ -600,10 +600,10 @@ fn test_multi_ccall_standalone_ccall_chain() {
 
     // Second resume: evaluate last (near/ccall-result)
     let mut env3 = state2.env.clone();
-    env3.push((
+    env3.push(
         "__ccall_result__".to_string(),
         LispVal::Str("second_result".to_string()),
-    ));
+    );
     let mut gas3 = state2.gas;
     let result3 = run_remaining_with_ccall(&state2.remaining, &mut env3, &mut gas3).unwrap();
 
@@ -618,7 +618,7 @@ fn test_multi_ccall_standalone_ccall_chain() {
 #[test]
 fn test_multi_ccall_mixed_define_and_standalone() {
     // Consecutive ccalls (define + standalone) batch together
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define a (near/ccall "x.near" "f" "{}"))
         (near/ccall "y.near" "g" "{}")
@@ -641,11 +641,11 @@ fn test_multi_ccall_mixed_define_and_standalone() {
 
     // Resume: inject both a and __ccall_result__
     let mut env2 = state.env.clone();
-    env2.push(("a".to_string(), LispVal::Str("result_a".to_string())));
-    env2.push((
+    env2.push("a".to_string(), LispVal::Str("result_a".to_string()));
+    env2.push(
         "__ccall_result__".to_string(),
         LispVal::Str("result_y".to_string()),
-    ));
+    );
     let mut gas2 = state.gas;
     let result2 = run_remaining_with_ccall(&state.remaining, &mut env2, &mut gas2).unwrap();
 
@@ -660,7 +660,7 @@ fn test_multi_ccall_mixed_define_and_standalone() {
 #[test]
 fn test_ccall_args_evaluated() {
     // Args expression should be evaluated before yielding
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"
         (define x "hello")
         (define result (near/ccall "test.near" "method" x))
@@ -678,7 +678,7 @@ fn test_ccall_args_evaluated() {
 fn test_run_program_synchronous_ignores_ccall_in_body() {
     // run_program (synchronous) doesn't know about ccall — it will try to
     // evaluate (near/ccall ...) as a regular function call and hit "undefined"
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let result = run_program(
         r#"(near/ccall "test.near" "method" "{}")"#,
         &mut env,
@@ -693,7 +693,7 @@ fn test_hex_roundtrip() {
     // Verify VmState borsh roundtrip works correctly
     let state = VmState {
         remaining: vec![],
-        env: vec![],
+        env: Env::new(),
         gas: 100,
         pending_vars: vec![],
     };
@@ -759,7 +759,7 @@ fn setup_test_vm() {
 #[test]
 fn test_storage_write_read() {
     setup_test_vm();
-    let mut e = Vec::new();
+    let mut e = Env::new();
     // Write
     let r = run_program(r#"(near/storage-write "mykey" "myval")"#, &mut e, 10_000);
     assert_eq!(r.unwrap(), "true");
@@ -771,7 +771,7 @@ fn test_storage_write_read() {
 #[test]
 fn test_storage_read_missing() {
     setup_test_vm();
-    let mut e = Vec::new();
+    let mut e = Env::new();
     let r = run_program(r#"(near/storage-read "nonexistent")"#, &mut e, 10_000);
     assert_eq!(r.unwrap(), "nil");
 }
@@ -779,7 +779,7 @@ fn test_storage_read_missing() {
 #[test]
 fn test_storage_has() {
     setup_test_vm();
-    let mut e = Vec::new();
+    let mut e = Env::new();
     // Key doesn't exist yet
     assert_eq!(eval_str(r#"(near/storage-has? "test-key")"#), "false");
     // Write it
@@ -791,7 +791,7 @@ fn test_storage_has() {
 #[test]
 fn test_storage_remove() {
     setup_test_vm();
-    let mut e = Vec::new();
+    let mut e = Env::new();
     // Write then remove
     let _ = run_program(r#"(near/storage-write "rm-key" "val")"#, &mut e, 10_000);
     let r = run_program(r#"(near/storage-remove "rm-key")"#, &mut e, 10_000);
@@ -1508,11 +1508,11 @@ fn test_storage_gas_single_write_low() {
 fn test_storage_gas_consumed_more_than_without() {
     setup_test_vm();
     // Expression without storage
-    let mut env1 = Vec::new();
+    let mut env1 = Env::new();
     let _ = run_program("(+ 1 2)", &mut env1, 10000);
     // We can't directly observe remaining gas from run_program, but we verify
     // that storage ops consume more gas than pure computation
-    let mut env2 = Vec::new();
+    let mut env2 = Env::new();
     let result = run_program(
         r#"(progn (near/storage-write "k1" "v1") (+ 1 2))"#,
         &mut env2,
@@ -1618,7 +1618,7 @@ fn test_eval_whitelist_remove() {
 #[test]
 fn test_ccall_view_yields_with_zero_deposit() {
     setup_test_vm();
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"(define x (near/ccall-view "x.near" "f" "{}"))"#;
     let result = near_lisp::run_program_with_ccall(code, &mut env, 10_000).unwrap();
     match result {
@@ -1636,7 +1636,7 @@ fn test_ccall_view_yields_with_zero_deposit() {
 #[test]
 fn test_ccall_call_yields_with_deposit_and_gas() {
     setup_test_vm();
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"(define x (near/ccall-call "x.near" "f" "{}" "1000000" "100"))"#;
     let result = near_lisp::run_program_with_ccall(code, &mut env, 10_000).unwrap();
     match result {
@@ -1654,7 +1654,7 @@ fn test_ccall_call_yields_with_deposit_and_gas() {
 #[test]
 fn test_ccall_view_standalone_yields() {
     setup_test_vm();
-    let mut env = Vec::new();
+    let mut env = Env::new();
     let code = r#"(near/ccall-view "oracle.near" "get_price" "{}")"#;
     let result = near_lisp::run_program_with_ccall(code, &mut env, 10_000).unwrap();
     match result {
@@ -1882,7 +1882,7 @@ fn test_stdlib_cached_require_saves_gas() {
     let code2 = r#"(require "math") (min 3 5)"#;
 
     // Load math with ample gas
-    let mut env = Vec::new();
+    let mut env = Env::new();
     run_program(code1, &mut env, 50_000).unwrap();
 
     // Second require + call should work with low gas since require is cached

@@ -17,10 +17,13 @@ A NEAR smart contract that runs a Lisp interpreter inside the VM. Use it to:
 ## Quick start
 
 ```bash
-# Build WASM (requires Rust 1.86.0 + cargo-near)
+# Build WASM (requires Rust 1.86.0 — NEAR rejects WASM from newer rustc)
 rustup override set 1.86.0
 rustup target add wasm32-unknown-unknown --toolchain 1.86.0
-cargo near build non-reproducible-wasm --no-abi
+cargo build --target wasm32-unknown-unknown --release
+wasm-opt -Oz --strip-debug --signext-lowering \
+  -o target/near/near_lisp.wasm \
+  target/wasm32-unknown-unknown/release/near_lisp.wasm
 rustup override unset
 
 # Or use the REPL locally
@@ -155,6 +158,34 @@ cargo test --test lisp_testnet -- --nocapture
 | `set_gas_limit` / `get_gas_limit` | limit | Gas management |
 | `transfer_ownership` / `get_owner` | AccountId | Owner management |
 | `add_to_eval_whitelist` / `remove_from_eval_whitelist` / `get_eval_whitelist` | AccountId | Eval access control |
+
+### Autonomous execution (callback pattern)
+
+The callback methods enable fully autonomous on-chain computation — one call in, one callback out. No polling or orchestration needed.
+
+| Method | Params | Description |
+|--------|--------|-------------|
+| `eval_async_with_callback` | `code, callback_account, callback_method` | Run Lisp, deliver result to `callback_account.callback_method` |
+| `eval_script_async_with_callback` | `name, callback_account, callback_method` | Same, but runs a stored script |
+
+**How it works:**
+
+1. Agent calls `eval_async_with_callback("(define price ...)", "agent.testnet", "on_result")`
+2. kampy runs the code — if ccalls are needed, it yields/resumes automatically
+3. When done, kampy fires a cross-contract call to `agent.testnet.on_result(result_string)`
+
+The callback fires immediately if no ccalls are needed, or after the yield/resume cycle completes for async computations. The caller's `on_result` method receives the result string as raw bytes.
+
+```lisp
+;; Agent kicks off autonomous computation
+eval_async_with_callback(
+  "(define p (near/ccall-view \"ref.near\" \"get_price\" \"{}\"))
+   (if (> (to-num p) 1000) \"sell\" \"hold\")",
+  "agent.testnet",
+  "execute"
+)
+;; → kampy handles the ccall, computes, then calls agent.testnet.execute("sell")
+```
 
 ## Gas safety
 
