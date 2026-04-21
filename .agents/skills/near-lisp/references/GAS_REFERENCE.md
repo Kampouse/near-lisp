@@ -23,13 +23,21 @@ Baseline (no loop, eval `"1"`): 1.98 Tgas
 ### Multi-binding loops
 
 ```
-2-binding (loop ((i 0) (sum 0)) ...):
-  10K = 35.02 Tgas (3.50 Ggas/iter)
-  100K = 301.20 Tgas (3.01 Ggas/iter)
+2-binding sum (loop ((i 0) (sum 0)) (if (>= i N) sum (recur (+ i 1) (+ sum i)))):
+  10K  = 37.87 Tgas  (3.79 Ggas/iter)
+  30K  = 109.92 Tgas (3.66 Ggas/iter)
+  50K  = 181.97 Tgas (3.64 Ggas/iter)
+  75K  = 272.03 Tgas (3.63 Ggas/iter)
+  100K = OOG at 299.14 Tgas (inner limit hit at ~82.5K iters)
+
+  Linear: 3.60 Ggas/iter + 1.85 Tgas overhead
+  Max at 300 Tgas: ~82,764 iterations
 
 3-binding + mod + if (odd/even):
   Max: 45,755 iterations at 301.42 Tgas (6.59 Ggas/iter)
 ```
+
+**Note (Apr 2026):** Gas accounting switched from synthetic counter to real NEAR gas via `env::used_gas()`. The eval_gas_limit is now in real gas units (300 Tgas default). Previous synthetic benchmarks (1,450,000 eval steps = ~194K loop iterations) are no longer valid.
 
 ### Per-iteration cost breakdown
 
@@ -51,7 +59,7 @@ An `if` wrapping a loop is evaluated once, not per iteration. Cost: ~0.02-0.04 T
 ```
 Pattern                         Max iters    Ggas/iter
 1-binding count                 129,672      2.33
-2-binding count                 ~99,600      3.01
+2-binding sum                   ~82,764      3.63
 2-bind + mod + if(sum)          38,310       6.20
 3-bind + mod + if branch        45,755       6.59
 ```
@@ -83,18 +91,20 @@ N=50,000: 78.46 Tgas   (1.57 Ggas/elem)
 
 Amortized: ~1.57 Ggas/elem at scale. O(n) confirmed.
 
-### Higher-order functions (native Rust outer loop + lambda per element)
+### Higher-order functions (native Rust outer loop + compiled lambda per element)
+
+Compiled lambdas run through `run_compiled_lambda` with gas checks every 16 ops (commit 9f04b30). Previous numbers (9.2/9.0 Ggas/elem) were for tree-walk lambdas without gas passthrough.
 
 ```
 Operation     Ggas/elem (at scale)   Note
-map           9.2                    Allocates output list
-filter        9.0                    Allocates output list
-every         8.1                    Short-circuits on false
+map           4.1                    Compiled lambda, allocates output list
+filter        4.4                    Compiled lambda, allocates output list
+every         8.1                    Short-circuits on false (tree-walk path)
 find          4.4                    Short-circuits, single value
 reduce        4.3                    No list allocation — cheapest
 ```
 
-Key insight: `reduce` is 2x cheaper than `map` because it doesn't build a new list. If you can express your problem as a reduction (sums, counts, min/max), prefer it over map-then-aggregate.
+Key insight: `reduce` and `map` are now nearly equal cost per element. The old 2x gap (map vs reduce) was due to tree-walk lambda dispatch overhead in map/filter, now eliminated by the compiled lambda path.
 
 ### Structural operations
 
@@ -130,7 +140,8 @@ Operation         Max elements
 range creation    ~190,000
 sort              ~140,000
 reduce +          ~70,000
-map (* x 2)       ~32,000
+map (* x 2)       ~71,700    (was ~32,000 before compiled lambda gas fix)
+filter odd?       ~67,300    (was ~17,100 before compiled lambda gas fix)
 zip               ~45,000
 ```
 
@@ -205,10 +216,12 @@ print(f'Total: {total/1e12:.2f} Tgas')
 
 ```
 Pattern                         Max capacity (300 Tgas)
-Pure compute loop               ~130,000 iterations
+Pure compute loop (1-bind)      ~129,000 iterations
+2-binding sum loop              ~82,000 iterations
 Odd/even + mod + branch         ~45,000 iterations
 Reduce on list                  ~70,000 elements
-Map on list                     ~32,000 elements
+Map on list                     ~71,700 elements (2.2x improvement from compiled lambda)
+Filter on list                  ~67,300 elements (3.9x improvement from compiled lambda)
 List creation (range)           ~190,000 elements
 Sort                            ~140,000 elements
 Single ccall                    55T minimum
@@ -217,4 +230,8 @@ Single ccall                    55T minimum
 Rule of thumb: if it fits in a SQL WHERE clause, it fits on-chain.
 If it needs a full table scan, it doesn't.
 Data > compute: list allocation is the bottleneck, not the loop body.
+
+Gas model: real NEAR gas via env::used_gas() (since Apr 2026).
+eval_gas_limit = 300 Tgas = 300,000,000,000,000 gas units (1:1 with chain).
+Inner OOG returns "out of gas" error cleanly.
 ```

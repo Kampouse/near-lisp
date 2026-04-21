@@ -27,7 +27,7 @@ src/
 ├── types.rs      — LispVal, Env, constants, stdlib code (234 lines)
 ├── parser.rs     — tokenize, parse, parse_all (137 lines)
 ├── helpers.rs    — is_truthy, as_num, match_pattern, do_arith (333 lines)
-├── bytecode.rs   — Op, CompiledLoop, LoopCompiler, run_compiled_loop (665 lines)
+`├── bytecode.rs   — Op, CompiledLoop, LoopCompiler, run_compiled_loop, peephole_optimize (~860 lines)`
 ├── eval.rs       — lisp_eval, dispatch_call, apply_lambda (1309 lines)
 ├── vm.rs         — VmState, RunResult, ccall machinery, run_program (541 lines)
 └── contract.rs   — #[near_bindgen] LispContract + impl (891 lines)
@@ -629,13 +629,14 @@ The `eval_gas_limit` (default 300 Tgas) is still stored but only used as a safet
 ### Performance Reference (bytecode VM with super-fused ops + peephole mega-fuse, 300 Tgas cap):
 
 - Pure compute loop (1-binding): ~0.74 Ggas/iter marginal, max ~401K iterations
-- 2-binding sum loop (mega-fused RecurIncAccum): ~0.150 Ggas/iter, max ~2M iterations
-- 2-binding sum loop (>= only, compile-time fast-path): ~0.286 Ggas/iter, max ~1M iterations
+- 2-binding sum loop (peephole mega-fuse, all cmp types): ~0.150 Ggas/iter, max ~2M iterations
+- 2-binding sum loop (compile-time fast-path, >= only): ~0.286 Ggas/iter, max ~1M iterations
 - 2-binding sum loop (peephole-only, not mega-fused): ~1.50 Ggas/iter, max ~194K iterations
 - Extra binding cost (generic path): ~0.76 Ggas/iter
 - Baseline (eval overhead): ~1.50 Tgas
 - Reduce on list: ~4.3 Ggas/elem, max ~70K elements
-- Map on list: ~9.2 Ggas/elem, max ~32K elements
+- Map on list: ~4.1 Ggas/elem, max ~71.7K elements (compiled lambda, was 9.2/32K)
+- Filter on list: ~4.4 Ggas/elem, max ~67.3K elements (compiled lambda, was 9.0/17.1K)
 - List creation: ~1.6 Ggas/elem, max ~190K elements
 - Sort: ~2.1 Ggas/elem (O(n log n))
 
