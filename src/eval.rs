@@ -1145,6 +1145,19 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                     Some(other) => return Err(format!("map: expected list, got {}", other)),
                     None => return Err("map: need (f list)".into()),
                 };
+                // Fast path: compile lambda to bytecode
+                if let LispVal::Lambda { params, rest_param: None, body, closed_env } = func {
+                    if params.len() == 1 {
+                        if let Some(cl) = crate::bytecode::try_compile_lambda(params, body, closed_env, env) {
+                            let mut result = Vec::with_capacity(lst.len());
+                            for elem in &lst {
+                                result.push(crate::bytecode::run_compiled_lambda(&cl, &[elem.clone()], gas)?);
+                            }
+                            return Ok(LispVal::List(result));
+                        }
+                    }
+                }
+                // Fallback: full eval
                 let mut result = Vec::with_capacity(lst.len());
                 for elem in &lst {
                     result.push(call_val(func, &[elem.clone()], env, gas)?);
@@ -1160,6 +1173,21 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                     Some(other) => return Err(format!("filter: expected list, got {}", other)),
                     None => return Err("filter: need (pred list)".into()),
                 };
+                // Fast path: compile lambda to bytecode
+                if let LispVal::Lambda { params, rest_param: None, body, closed_env } = func {
+                    if params.len() == 1 {
+                        if let Some(cl) = crate::bytecode::try_compile_lambda(params, body, closed_env, env) {
+                            let mut result = Vec::new();
+                            for elem in &lst {
+                                if is_truthy(&crate::bytecode::run_compiled_lambda(&cl, &[elem.clone()], gas)?) {
+                                    result.push(elem.clone());
+                                }
+                            }
+                            return Ok(LispVal::List(result));
+                        }
+                    }
+                }
+                // Fallback: full eval
                 let mut result = Vec::new();
                 for elem in &lst {
                     if is_truthy(&call_val(func, &[elem.clone()], env, gas)?) {

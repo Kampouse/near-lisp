@@ -1180,6 +1180,227 @@ pub fn eval_builtin(name: &str, args: &[LispVal]) -> Result<LispVal, String> {
     }
 }
 
+/// Compiled lambda: a flat bytecode program with N param slots + captured env slots.
+/// Used for fast-path map/filter/reduce — avoids env push/pop per element.
+pub struct CompiledLambda {
+    num_param_slots: usize,
+    code: Vec<Op>,
+    captured: Vec<(String, LispVal)>,
+}
+
+/// Try to compile a lambda body for fast inline evaluation.
+/// Returns None if the body contains unsupported forms.
+pub fn try_compile_lambda(
+    param_names: &[String],
+    body: &LispVal,
+    closed_env: &[(String, LispVal)],
+    outer_env: &Env,
+) -> Option<CompiledLambda> {
+    let mut compiler = LoopCompiler::new(param_names.to_vec());
+    // Pre-register captured env from the lambda closure
+    for (name, val) in closed_env {
+        compiler.captured.push((name.clone(), val.clone()));
+    }
+    if !compiler.compile_expr(body, outer_env) {
+        return None;
+    }
+    compiler.code.push(Op::Return);
+    let mut code = compiler.code;
+    peephole_optimize(&mut code);
+    peephole_optimize(&mut code);
+    peephole_optimize(&mut code);
+    Some(CompiledLambda {
+        num_param_slots: param_names.len(),
+        code,
+        captured: compiler.captured,
+    })
+}
+
+/// Run a compiled lambda with the given arguments. Returns the result directly.
+/// Checks gas every 16 ops to amortize env::used_gas() cost (~0.8 Ggas per call).
+pub fn run_compiled_lambda(cl: &CompiledLambda, args: &[LispVal], gas: &mut u64) -> Result<LispVal, String> {
+    let mut slots: Vec<LispVal> = Vec::with_capacity(cl.num_param_slots + cl.captured.len());
+    // Fill param slots
+    for i in 0..cl.num_param_slots {
+        slots.push(args.get(i).cloned().unwrap_or(LispVal::Nil));
+    }
+    // Fill captured env slots
+    for (_, val) in &cl.captured {
+        slots.push(val.clone());
+    }
+    let mut stack: Vec<LispVal> = Vec::with_capacity(8);
+    let code = &cl.code;
+    let mut pc: usize = 0;
+    let mut op_count: u32 = 0;
+
+    loop {
+        // Check gas every 16 ops — amortizes the env::used_gas() host call overhead
+        op_count += 1;
+        if op_count & 0xF == 0 {
+            crate::types::check_gas(gas)?;
+        }
+        match &code[pc] {
+            Op::LoadSlot(s) => {
+                let slot_ref = &slots[*s];
+                match slot_ref {
+                    LispVal::Num(n) => stack.push(LispVal::Num(*n)),
+                    _ => stack.push(slot_ref.clone()),
+                }
+                pc += 1;
+            }
+            Op::PushI64(n) => {
+                stack.push(LispVal::Num(*n));
+                pc += 1;
+            }
+            Op::PushFloat(f) => {
+                stack.push(LispVal::Float(*f));
+                pc += 1;
+            }
+            Op::PushBool(b) => {
+                stack.push(LispVal::Bool(*b));
+                pc += 1;
+            }
+            Op::PushStr(s) => {
+                stack.push(LispVal::Str(s.clone()));
+                pc += 1;
+            }
+            Op::PushNil => {
+                stack.push(LispVal::Nil);
+                pc += 1;
+            }
+            Op::Add => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Num(a + b));
+                pc += 1;
+            }
+            Op::Sub => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Num(a - b));
+                pc += 1;
+            }
+            Op::Mul => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Num(a * b));
+                pc += 1;
+            }
+            Op::Div => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                if b == 0 {
+                    return Err("division by zero".into());
+                }
+                stack.push(LispVal::Num(a / b));
+                pc += 1;
+            }
+            Op::Mod => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                if b == 0 {
+                    return Err("modulo by zero".into());
+                }
+                stack.push(LispVal::Num(a % b));
+                pc += 1;
+            }
+            Op::Eq => {
+                let b = stack.pop().unwrap_or(LispVal::Nil);
+                let a = stack.pop().unwrap_or(LispVal::Nil);
+                stack.push(LispVal::Bool(lisp_eq(&a, &b)));
+                pc += 1;
+            }
+            Op::Lt => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Bool(a < b));
+                pc += 1;
+            }
+            Op::Le => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Bool(a <= b));
+                pc += 1;
+            }
+            Op::Gt => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Bool(a > b));
+                pc += 1;
+            }
+            Op::Ge => {
+                let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
+                stack.push(LispVal::Bool(a >= b));
+                pc += 1;
+            }
+            Op::SlotAddImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v + imm));
+                pc += 1;
+            }
+            Op::SlotSubImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v - imm));
+                pc += 1;
+            }
+            Op::SlotMulImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v * imm));
+                pc += 1;
+            }
+            Op::SlotDivImm(s, imm) => {
+                if *imm == 0 {
+                    return Err("division by zero".into());
+                }
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Num(v / imm));
+                pc += 1;
+            }
+            Op::SlotEqImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v == *imm));
+                pc += 1;
+            }
+            Op::SlotLtImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v < *imm));
+                pc += 1;
+            }
+            Op::SlotLeImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v <= *imm));
+                pc += 1;
+            }
+            Op::SlotGtImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v > *imm));
+                pc += 1;
+            }
+            Op::SlotGeImm(s, imm) => {
+                let v = num_val_ref(&slots[*s]);
+                stack.push(LispVal::Bool(v >= *imm));
+                pc += 1;
+            }
+            Op::BuiltinCall(name, n_args) => {
+                let mut bargs: Vec<LispVal> = Vec::with_capacity(*n_args);
+                for _ in 0..*n_args {
+                    bargs.push(stack.pop().unwrap_or(LispVal::Nil));
+                }
+                bargs.reverse();
+                let result = eval_builtin(name, &bargs)?;
+                stack.push(result);
+                pc += 1;
+            }
+            Op::Return => {
+                return Ok(stack.pop().unwrap_or(LispVal::Nil));
+            }
+            // Unsupported ops for lambda body — shouldn't appear but handle gracefully
+            _ => return Err("compiled lambda: unsupported op".into()),
+        }
+    }
+}
+
 /// Try to compile a loop into bytecode. Returns None if body is too complex.
 pub fn try_compile_loop(
     binding_names: &[String],
