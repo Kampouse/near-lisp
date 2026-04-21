@@ -5,28 +5,21 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
-use crate::types::{LispVal, Env, check_gas, get_stdlib_code};
+use crate::bytecode::{exec_compiled_loop, try_compile_loop};
 use crate::helpers::*;
-use crate::bytecode::{try_compile_loop, exec_compiled_loop};
 use crate::parser::parse_all;
-use crate::vm::{json_to_lisp, lisp_to_json, hex_encode, hex_decode};
+use crate::types::{get_stdlib_code, Env, LispVal};
+use crate::vm::{hex_decode, hex_encode, json_to_lisp, lisp_to_json};
 
 // ---------------------------------------------------------------------------
 // Evaluator
 // ---------------------------------------------------------------------------
 
-pub fn lisp_eval(
-    expr: &LispVal,
-    env: &mut Env,
-    gas: &mut u64,
-) -> Result<LispVal, String> {
+pub fn lisp_eval(expr: &LispVal, env: &mut Env, gas: &mut u64) -> Result<LispVal, String> {
     // Trampoline loop for TCO — tail positions rebind current_expr + continue.
     // Non-tail evaluations (args, conditions) still call lisp_eval recursively.
     let mut current_expr: LispVal = expr.clone();
     '_trampoline: loop {
-        check_gas(gas)?;
-
         match &current_expr {
             LispVal::Nil
             | LispVal::Bool(_)
@@ -195,14 +188,15 @@ pub fn lisp_eval(
                                             || clause[0] != LispVal::Sym("catch".into())
                                         {
                                             return Err(
-                                                "try: second arg must be (catch var body...)".into(),
+                                                "try: second arg must be (catch var body...)"
+                                                    .into(),
                                             );
                                         }
                                         let error_var = match clause.get(1) {
                                             Some(LispVal::Sym(s)) => s.clone(),
                                             _ => {
                                                 return Err(
-                                                    "try: catch needs a variable name".into(),
+                                                    "try: catch needs a variable name".into()
                                                 )
                                             }
                                         };
@@ -223,8 +217,7 @@ pub fn lisp_eval(
                         }
                         // match: env cleanup, recursive call
                         "match" => {
-                            let val =
-                                lisp_eval(list.get(1).ok_or("match: need expr")?, env, gas)?;
+                            let val = lisp_eval(list.get(1).ok_or("match: need expr")?, env, gas)?;
                             let mut matched: Option<(Vec<(String, LispVal)>, LispVal)> = None;
                             for clause in &list[2..] {
                                 if let LispVal::List(parts) = clause {
@@ -293,7 +286,9 @@ pub fn lisp_eval(
                                 }
                             }
                             // Try bytecode compilation for the loop body
-                            if let Some(cl) = try_compile_loop(&binding_names, binding_vals.clone(), body, env) {
+                            if let Some(cl) =
+                                try_compile_loop(&binding_names, binding_vals.clone(), body, env)
+                            {
                                 return exec_compiled_loop(&cl, gas, env);
                             }
                             // Fallback: tree-walk interpreter
@@ -386,8 +381,7 @@ pub fn lisp_eval(
                             ));
                         }
                         "near/log" => {
-                            let v =
-                                lisp_eval(list.get(1).ok_or("near/log: need arg")?, env, gas)?;
+                            let v = lisp_eval(list.get(1).ok_or("near/log: need arg")?, env, gas)?;
                             env::log_str(&v.to_string());
                             return Ok(LispVal::Nil);
                         }
@@ -447,10 +441,7 @@ pub fn lisp_eval(
                                 env.push(marker, LispVal::Bool(true));
                                 return Ok(LispVal::Nil);
                             }
-                            return Err(format!(
-                                "require: unknown module '{}'",
-                                module_name
-                            ));
+                            return Err(format!("require: unknown module '{}'", module_name));
                         }
                         _ => return dispatch_call(list, env, gas),
                     }
@@ -495,11 +486,7 @@ pub fn apply_lambda(
 // Function dispatch (builtins + lambda calls)
 // ---------------------------------------------------------------------------
 
-fn dispatch_call(
-    list: &[LispVal],
-    env: &mut Env,
-    gas: &mut u64,
-) -> Result<LispVal, String> {
+fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispVal, String> {
     let head = &list[0];
     let args: Vec<LispVal> = list[1..]
         .iter()
@@ -774,7 +761,10 @@ fn dispatch_call(
                         return Ok(LispVal::Str(format!("map{{{} keys}}: {}", m.len(), val)));
                     }
                     LispVal::Lambda { params, .. } => {
-                        return Ok(LispVal::Str(format!("lambda({}): <function>", params.len())));
+                        return Ok(LispVal::Str(format!(
+                            "lambda({}): <function>",
+                            params.len()
+                        )));
                     }
                     LispVal::Sym(s) => {
                         return Ok(LispVal::Str(format!("symbol: {}", s)));
@@ -1300,4 +1290,3 @@ fn call_val(
         _ => Err(format!("not callable: {}", func)),
     }
 }
-

@@ -5,13 +5,11 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
-use crate::types::{LispVal, Env, DEFAULT_EVAL_GAS_LIMIT, get_stdlib_code};
+use crate::eval::lisp_eval;
 use crate::helpers::*;
 use crate::parser::parse_all;
-use crate::eval::lisp_eval;
+use crate::types::{get_stdlib_code, Env, LispVal, DEFAULT_EVAL_GAS_LIMIT};
 use crate::vm::*;
-
 
 #[near(contract_state)]
 pub struct LispContract {
@@ -235,8 +233,7 @@ impl LispContract {
     /// Key is auto-prefixed with `eval:{caller}:`.
     pub fn get_data(&self, key: String) -> Option<String> {
         let storage_key = format!("eval:{}:{}", env::predecessor_account_id(), key);
-        env::storage_read(storage_key.as_bytes())
-            .map(|b| String::from_utf8_lossy(&b).to_string())
+        env::storage_read(storage_key.as_bytes()).map(|b| String::from_utf8_lossy(&b).to_string())
     }
 
     /// View: list all stored script names
@@ -365,11 +362,7 @@ impl LispContract {
     /// Lisp code can reference `input` or any key from input_json directly:
     ///   eval_script_async_with_input("oracle_query", r#"{"asset": "wrap.testnet"}"#)
     ///   → script sees `(dict/get input "asset")` → "wrap.testnet"
-    pub fn eval_script_async_with_input(
-        &mut self,
-        name: String,
-        input_json: String,
-    ) -> String {
+    pub fn eval_script_async_with_input(&mut self, name: String, input_json: String) -> String {
         assert!(self.is_eval_allowed(), "Caller not allowed to eval");
         match env::storage_read(format!("script:{}", name).as_bytes()) {
             Some(bytes) => {
@@ -508,10 +501,7 @@ impl LispContract {
                 );
                 result_str
             }
-            Ok(RunResult::Yield {
-                yields,
-                mut state,
-            }) => {
+            Ok(RunResult::Yield { yields, mut state }) => {
                 // Store callback in VmState so resume_eval can fire it later
                 state.callback = Some(CallbackInfo {
                     account: callback_account,
@@ -672,14 +662,18 @@ impl LispContract {
     pub fn auto_resume_batch_ccall(&mut self, data_id_hex: String) {
         // Guard: must be called as cross-contract callback
         let count = env::promise_results_count();
-        assert!(count > 0, "auto_resume_batch_ccall: must be called as callback");
+        assert!(
+            count > 0,
+            "auto_resume_batch_ccall: must be called as callback"
+        );
 
         let data_id_bytes = hex_decode(&data_id_hex);
         let data_id: CryptoHash = data_id_bytes.try_into().expect("data_id must be 32 bytes");
 
         // Collect ALL promise results
         let mut results: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
-        #[allow(deprecated)] // SDK 5.6.0 pinned; can't use promise_result_checked (needs rustc 1.88+)
+        #[allow(deprecated)]
+        // SDK 5.6.0 pinned; can't use promise_result_checked (needs rustc 1.88+)
         for i in 0..count {
             match env::promise_result(i) {
                 PromiseResult::Successful(data) => results.push(data),
@@ -722,11 +716,13 @@ impl LispContract {
         let total_ccall_gas: u64 = yields.iter().map(|y| y.gas_tgas * 1_000_000_000_000).sum();
         // auto_resume_batch_ccall iterates N promise results + borsh-serializes them
         // Base: ~2T, per-result: ~0.1T (promise_result read + push)
-        let auto_resume_gas = Gas::from_tgas(2 + (n as u64 * 100_000_000_000 / 1_000_000_000_000).max(1));
+        let auto_resume_gas =
+            Gas::from_tgas(2 + (n as u64 * 100_000_000_000 / 1_000_000_000_000).max(1));
         let yield_overhead: u64 = 5_000_000_000_000; // 5 Tgas (reduced from 40T→10T→5T)
-        // Dynamic reserve: accounts for Promise::and() chain overhead (~0.25T per .and() call)
-        // N promises → N-1 .and() calls + .then() callback (~0.3T) + misc overhead (~2T)
-        let reserve: u64 = (n as u64).saturating_sub(1)
+                                                     // Dynamic reserve: accounts for Promise::and() chain overhead (~0.25T per .and() call)
+                                                     // N promises → N-1 .and() calls + .then() callback (~0.3T) + misc overhead (~2T)
+        let reserve: u64 = (n as u64)
+            .saturating_sub(1)
             .saturating_mul(300_000_000_000) // 0.3T per .and() call (measured 0.252T + margin)
             .saturating_add(3_000_000_000_000); // 3T base overhead
 
@@ -762,7 +758,7 @@ impl LispContract {
 
         // Base overhead for resume: deserialize VmState + inject results + eval remaining
         let resume_base: u64 = 5_000_000_000_000; // 5T
-        // Per-ccall overhead in resume: promise_result read + JSON parse + env injection
+                                                  // Per-ccall overhead in resume: promise_result read + JSON parse + env injection
         let per_ccall_resume: u64 = 500_000_000_000; // 0.5T per ccall result
         let current_batch_cost = resume_base.saturating_add(n as u64 * per_ccall_resume);
 
@@ -789,7 +785,8 @@ impl LispContract {
             .saturating_sub(reserve);
 
         // Cap resume gas at what we actually need — don't waste the rest
-        let capped_effective = resume_effective.min(resume_gas_needed.saturating_sub(yield_overhead));
+        let capped_effective =
+            resume_effective.min(resume_gas_needed.saturating_sub(yield_overhead));
         let resume_gas = Gas::from_gas(capped_effective.saturating_add(yield_overhead));
 
         // Debug: log the full gas budget breakdown
@@ -848,7 +845,8 @@ impl LispContract {
             if (i + 1) % 25 == 0 || i == n - 1 {
                 env::log_str(&format!(
                     "GAS_AFTER_PROMISE_{}/{}: used={}T remaining={}T",
-                    i + 1, n,
+                    i + 1,
+                    n,
                     env::used_gas().as_gas() / 1_000_000_000_000,
                     (prepaid - env::used_gas().as_gas()) / 1_000_000_000_000,
                 ));
@@ -888,4 +886,3 @@ impl LispContract {
         "YIELDING".to_string()
     }
 }
-

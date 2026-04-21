@@ -5,21 +5,16 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
-use crate::types::{LispVal, Env};
-use crate::helpers::*;
 use crate::eval::lisp_eval;
+use crate::helpers::*;
 use crate::parser::parse_all;
+use crate::types::{Env, LispVal};
 
 // ---------------------------------------------------------------------------
 // Public interface — synchronous eval (no ccall support)
 // ---------------------------------------------------------------------------
 
-pub fn run_program(
-    code: &str,
-    env: &mut Env,
-    gas_limit: u64,
-) -> Result<String, String> {
+pub fn run_program(code: &str, env: &mut Env, gas_limit: u64) -> Result<String, String> {
     let exprs = parse_all(code)?;
     let mut gas = gas_limit;
     let mut result = LispVal::Nil;
@@ -412,10 +407,8 @@ pub fn run_program_with_ccall(
             .collect();
 
         // Extract pending_vars from the already-collected batch (no second scan)
-        let pending_vars: Vec<Option<String>> = batch
-            .iter()
-            .map(|info| info.pending_var.clone())
-            .collect();
+        let pending_vars: Vec<Option<String>> =
+            batch.iter().map(|info| info.pending_var.clone()).collect();
 
         let remaining = exprs[first_after_batch..].to_vec();
 

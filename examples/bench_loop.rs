@@ -28,7 +28,10 @@ fn main() {
         let mut hi: u64 = gas;
         while lo < hi {
             let mid = lo + (hi - lo + 1) / 2;
-            let code = format!("(loop ((a 0) (b 1)) (if (>= a {}) a (recur b (+ a b))))", mid);
+            let code = format!(
+                "(loop ((a 0) (b 1)) (if (>= a {}) a (recur b (+ a b))))",
+                mid
+            );
             match bench(&code, gas) {
                 Ok(r) if !r.contains("out of gas") && !r.contains("ERROR") => lo = mid,
                 _ => hi = mid - 1,
@@ -51,7 +54,12 @@ fn main() {
             }
         }
         let overhead = lo_gas as f64 / iters as f64;
-        println!("iters={:<8} min_gas={:<8} per_iter={:.3}  formula_overhead={:.0}", 
-                 iters, lo_gas, overhead, lo_gas as f64 - (iters as f64 * overhead));
+        println!(
+            "iters={:<8} min_gas={:<8} per_iter={:.3}  formula_overhead={:.0}",
+            iters,
+            lo_gas,
+            overhead,
+            lo_gas as f64 - (iters as f64 * overhead)
+        );
     }
 }

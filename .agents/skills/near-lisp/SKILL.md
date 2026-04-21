@@ -613,30 +613,52 @@ One-call autonomous pipeline — no polling or orchestration needed.
 
 See `references/GAS_REFERENCE.md` for detailed on-chain benchmarks.
 
-### Gas Accounting System
+### Gas Accounting
 
-The contract uses **real NEAR gas** for budget tracking, not a synthetic step counter.
+**No per-tick gas checking**. The NEAR runtime is the gas limit — no `check_gas()` calls in the bytecode VM or tree-walk eval loops. This maximizes throughput by eliminating `env::used_gas()` host call overhead (which was ~0.8 Ggas/iteration on its own).
 
-**How it works**: `check_gas()` (in `types.rs`) is feature-gated:
-- **WASM (on-chain)**: calls `env::used_gas().as_gas()` and compares against the budget minus a 2 Tgas buffer. This is 1:1 with actual NEAR gas consumption -- no calibration needed.
-- **Native (tests)**: decrements a synthetic `u64` counter by 1 per eval tick. This keeps tests simple without needing `used_gas()` mocks.
+**History**: Originally had `check_gas()` calling `env::used_gas()` every VM tick. This caused a 36% regression (130K → ~79K iterations) because the host call itself burns significant gas. Removed: let the NEAR host enforce the gas limit naturally.
 
-The `eval_gas_limit` is stored as real NEAR gas units (e.g. `300_000_000_000_000` = 300 Tgas). Set via `set_gas_limit()`. Default: 300 Tgas.
+The `eval_gas_limit` (default 300 Tgas) is still stored but only used as a safety upper bound in `run_program()`. The actual limit is the prepaid gas attached to the transaction.
 
-**Storage ops**: No separate gas accounting. NEAR charges real gas for `storage_read/write/remove` natively -- `check_gas()` at the eval loop level catches the total.
+**Peephole optimizer fusions**: The bytecode compiler fuses common patterns:
+- `LoadSlot(s) + PushI64(imm) + Arith/Cmp` → `SlotAddImm`, `SlotGeImm`, etc. (eliminates stack push/pop)
+- `SlotCmpImm(s, imm) + JumpIfFalse(addr)` → `JumpIfSlotGeImm(s, imm, addr)` etc. (eliminates bool construction entirely)
+- `Recur(n)` with n ≤ 4 → `RecurDirect(n)` (no Vec allocation)
 
-**Old system** (removed): was a flat synthetic counter (`*gas -= 1` per eval call, separate `STORAGE_GAS_COST = 100` for storage ops). Replaced because it couldn't predict actual NEAR gas consumption.
-
-### Performance Reference (bytecode VM with peephole optimizer, 300 Tgas cap):
+### Performance Reference (bytecode VM with super-fused ops + peephole mega-fuse, 300 Tgas cap):
 
 - Pure compute loop (1-binding): ~0.74 Ggas/iter marginal, max ~401K iterations
-- Pure compute loop (2-binding): ~1.54 Ggas/iter marginal, max ~194K iterations
-- Extra binding cost: ~0.79 Ggas/iter
+- 2-binding sum loop (mega-fused RecurIncAccum): ~0.150 Ggas/iter, max ~2M iterations
+- 2-binding sum loop (>= only, compile-time fast-path): ~0.286 Ggas/iter, max ~1M iterations
+- 2-binding sum loop (peephole-only, not mega-fused): ~1.50 Ggas/iter, max ~194K iterations
+- Extra binding cost (generic path): ~0.76 Ggas/iter
 - Baseline (eval overhead): ~1.50 Tgas
 - Reduce on list: ~4.3 Ggas/elem, max ~70K elements
 - Map on list: ~9.2 Ggas/elem, max ~32K elements
 - List creation: ~1.6 Ggas/elem, max ~190K elements
 - Sort: ~2.1 Ggas/elem (O(n log n))
+
+### RecurIncAccum mega-fuse (compile-time + peephole)
+
+**Two paths** produce the `RecurIncAccum` op:
+
+1. **Compile-time fast-path** (in `compile_body`): Detects `(>= counter limit)` pattern at AST level. Only fires for `>=` comparison. Emits 4 ops: `JumpIfSlotGeImm + RecurIncAccum + LoadSlot + Return`. Result: 0.286 Ggas/iter.
+
+2. **Peephole mega-fuse** (in `peephole_optimize`): Detects 6-op contiguous pattern in generic compiler output: `JumpIfSlot*CmpImm + SlotAddImm + LoadSlot(accum) + LoadSlot(counter) + Add + RecurDirect`. Works for ALL comparison types (>=, >, <=, <, ==) by adjusting the limit (e.g., `> N` → limit `N+1`). Result: 0.150 Ggas/iter (lower than compile-time because no initial JumpIfSlotGeImm guard needed — RecurIncAccum handles both check and loop).
+
+The generic compiler emits else-first (recur body before then branch) so the peephole's 6-op sliding window can see the full contiguous pattern. This required restructuring the original then-first layout where `LoadSlot + Return` sat between the condition and recur body, preventing fusion.
+
+**3-pass peephole**: The optimizer runs 3 passes to allow multi-level fusion:
+- Pass 1: `LoadSlot + PushI64 + Cmp` → `SlotGtImm` etc., `LoadSlot + PushI64 + Add` → `SlotAddImm`, `Recur(n)` → `RecurDirect(n)`
+- Pass 2: `SlotCmpImm + JumpIfTrue/False` → `JumpIfSlotGtImm` etc.
+- Pass 3: 6-op mega-fuse → `RecurIncAccum`
+
+**Critical bugs (fixed)**:
+1. **index_map off-by-one**: The index_map must push entries for ALL consumed ops. Original code had `for _ in 1..5` (4 entries for 6 consumed ops, missing the 5th). This caused exit_addr remapping to point to `Return` instead of `LoadSlot`, making `>`, `<=`, `<` variants return `nil`. Fix: `for _ in 0..5` (5 entries + the auto-pushed first entry = 6 total).
+2. **SlotAddImm/SlotSubImm eager writeback**: These fused ops were writing result to BOTH slot AND stack. But `Recur`/`RecurDirect` expects values on stack (pops into slots atomically). Early writeback corrupted subsequent reads of same slot (off-by-one in accum). Fix: only push to stack, don't modify slot.
+
+**Rust pitfall**: `LispVal` has NO methods (`as_sym`, `as_list`, `as_num` don't exist). Use direct pattern matching on `&LispVal` variants. When matching `&LispVal::Num(limit)` against `&LispVal`, `limit` binds as `&i64` — use `*limit` to deref. Toolchain 1.86.0 (required for WASM) is stricter about match ergonomics than newer versions.
 
 **IMPORTANT — Gas measurement on-chain**: The `near` CLI `Gas burned` line shows TRANSACTION-level gas (signing overhead), NOT execution gas. A 10K-iter loop shows "0.309 Tgas" in CLI but actually burns ~9 Tgas. Always use RPC `EXPERIMENTAL_tx_status` to get `receipts_outcome[].outcome.gas_burnt` for accurate numbers. Receipt[0] is the function execution, Receipt[1+] are overhead.
 
@@ -845,6 +867,7 @@ NearDefi oracle prices are all stale on testnet (last reports from 2022-2023). T
 - `loop/recur` is the ONLY iteration pattern with zero stack growth. Recursive lambdas overflow at ~100-200 depth.
 - Rust borrow checker: when injecting JSON input into env, iterate `&map` (borrow) not `map` (move) if you need the map again afterwards
 - **Testnet integration testing**: `near` CLI v0.24+ returns values as JSON after "Function execution return value" line. Parse with regex `r'return value.*?:\n(.+?)(?:\n\n)'`. Values are double-encoded (outer JSON string → inner value). For async ccalls: extract tx hash from output → sleep 4-5s → RPC `EXPERIMENTAL_tx_status` → iterate `receipts_outcome` → base64 decode `SuccessValue`. Receipt order: [0]=yield setup, [1]=resume result, [N]=ccall targets.
+- **Local testing when near-workspaces fails**: `cargo test` may fail with `deflate64` compilation errors (transitive dep from near-workspaces, incompatible with rustc 1.86.0 for native targets). Workaround: write a test binary in `src/bin/test_bytecode.rs` using only public crate API (`parse_all`, `lisp_eval`, `Env`, `LispVal`). Run with `cargo run --bin test_bytecode`. This only depends on the lib crate (near-sdk, borsh, serde) which compile fine for native targets.
 
 ## Implementation & Testing
 

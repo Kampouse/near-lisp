@@ -42,7 +42,10 @@ fn test_bytes_hex_alias() {
 #[test]
 fn test_bytes_to_hex() {
     // bytes->hex returns a Lisp String, so Display wraps in quotes
-    assert_eq!(eval_str(r#"(bytes->hex (hex->bytes "0xdeadbeef"))"#), r#""0xdeadbeef""#);
+    assert_eq!(
+        eval_str(r#"(bytes->hex (hex->bytes "0xdeadbeef"))"#),
+        r#""0xdeadbeef""#
+    );
 }
 
 #[test]
@@ -57,12 +60,18 @@ fn test_bytes_len_empty() {
 
 #[test]
 fn test_bytes_to_string() {
-    assert_eq!(eval_str(r#"(bytes->string (string->bytes "hello"))"#), r#""hello""#);
+    assert_eq!(
+        eval_str(r#"(bytes->string (string->bytes "hello"))"#),
+        r#""hello""#
+    );
 }
 
 #[test]
 fn test_string_to_bytes() {
-    assert_eq!(eval_str(r#"(bytes->hex (string->bytes "AB"))"#), r#""0x4142""#);
+    assert_eq!(
+        eval_str(r#"(bytes->hex (string->bytes "AB"))"#),
+        r#""0x4142""#
+    );
 }
 
 #[test]
@@ -88,7 +97,10 @@ fn test_bytes_type() {
 
 #[test]
 fn test_bytes_roundtrip() {
-    assert_eq!(eval_str(r#"(bytes->hex (hex->bytes "0x0102030405"))"#), r#""0x0102030405""#);
+    assert_eq!(
+        eval_str(r#"(bytes->hex (hex->bytes "0x0102030405"))"#),
+        r#""0x0102030405""#
+    );
 }
 
 // ===========================================================================
@@ -98,7 +110,10 @@ fn test_bytes_roundtrip() {
 #[test]
 fn test_contract_save_and_get_module() {
     let mut contract = setup_contract();
-    contract.save_module("test-mod".to_string(), "(define (m-double x) (* x 2))".to_string());
+    contract.save_module(
+        "test-mod".to_string(),
+        "(define (m-double x) (* x 2))".to_string(),
+    );
     let m = contract.get_module("test-mod".to_string());
     assert_eq!(m, Some("(define (m-double x) (* x 2))".to_string()));
 }
@@ -208,7 +223,10 @@ fn test_contract_storage_usage() {
     let usage_before = contract.storage_usage();
     contract.save_policy("test-storage-policy".to_string(), "(= 1 1)".to_string());
     let usage_after = contract.storage_usage();
-    assert!(usage_after > usage_before, "storage usage should increase after write");
+    assert!(
+        usage_after > usage_before,
+        "storage usage should increase after write"
+    );
 }
 
 #[test]
@@ -323,7 +341,9 @@ fn test_nep297_remove_policy_event() {
     contract.remove_policy("to-remove-pol".to_string());
     let all_events = get_event_logs();
     // The remove event is the last EVENT_JSON after the save event
-    let remove_evt = all_events.iter().find(|e| e.contains("\"remove_policy\""))
+    let remove_evt = all_events
+        .iter()
+        .find(|e| e.contains("\"remove_policy\""))
         .expect("no remove_policy event found");
     assert_event(remove_evt, "remove_policy", "to-remove-pol");
 }

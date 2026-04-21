@@ -5,9 +5,8 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
 use crate::helpers::is_truthy;
-use crate::types::{check_gas, Env, LispVal};
+use crate::types::{Env, LispVal};
 
 // ---------------------------------------------------------------------------
 // Loop Bytecode Compiler — tight VM for loop/recur
@@ -26,7 +25,6 @@ use crate::types::{check_gas, Env, LispVal};
 //   - No AST traversal (compiled jump targets)
 //   - No LispVal::List construction for recur args
 // ---------------------------------------------------------------------------
-
 
 /// Bytecode opcodes for the loop VM.
 #[derive(Clone, Debug)]
@@ -94,6 +92,19 @@ enum Op {
     SlotGeImm(usize, i64),
     /// Like Recur but for small N — no Vec allocation
     RecurDirect(usize),
+    // --- Super-fused ops: eliminate stack traffic entirely ---
+    /// Compare slots[s] with imm, jump to addr if condition is true (no stack push/pop)
+    JumpIfSlotLtImm(usize, i64, usize),
+    JumpIfSlotLeImm(usize, i64, usize),
+    JumpIfSlotGtImm(usize, i64, usize),
+    JumpIfSlotGeImm(usize, i64, usize),
+    JumpIfSlotEqImm(usize, i64, usize),
+    // --- Mega-fused: entire loop body in one op ---
+    /// RecurIncAccum(counter_slot, accum_slot, step_imm, limit_imm, exit_addr):
+    /// if slots[counter] >= limit_imm → jump to exit_addr
+    /// else: accum += counter; counter += step_imm; jump to loop_start (pc=0)
+    /// Covers: (loop ((i 0) (sum 0)) (if (>= i N) sum (recur (+ i 1) (+ sum i))))
+    RecurIncAccum(usize, usize, i64, i64, usize),
 }
 
 /// Compiled loop representation.
@@ -114,7 +125,7 @@ pub struct CompiledLoop {
 
 /// Compilation context
 struct LoopCompiler {
-    slot_map: Vec<String>,  // slot index → binding name
+    slot_map: Vec<String>, // slot index → binding name
     code: Vec<Op>,
     /// Outer env variables captured at compile time (name, value)
     captured: Vec<(String, LispVal)>,
@@ -122,7 +133,11 @@ struct LoopCompiler {
 
 impl LoopCompiler {
     fn new(slot_names: Vec<String>) -> Self {
-        Self { slot_map: slot_names, code: Vec::new(), captured: Vec::new() }
+        Self {
+            slot_map: slot_names,
+            code: Vec::new(),
+            captured: Vec::new(),
+        }
     }
 
     /// Look up binding name → slot index (bindings first, then captured env)
@@ -138,7 +153,9 @@ impl LoopCompiler {
 
     /// Try to capture an unknown symbol from outer env. Returns true if captured.
     fn try_capture(&mut self, name: &str, outer_env: &Env) -> bool {
-        if self.slot_of(name).is_some() { return true; }
+        if self.slot_of(name).is_some() {
+            return true;
+        }
         if let Some(val) = outer_env.get(name) {
             self.captured.push((name.to_string(), val.clone()));
             return true;
@@ -149,11 +166,26 @@ impl LoopCompiler {
     /// Try to compile an expression. Returns false if unsupported.
     fn compile_expr(&mut self, expr: &LispVal, outer_env: &Env) -> bool {
         match expr {
-            LispVal::Num(n) => { self.code.push(Op::PushI64(*n)); true }
-            LispVal::Float(f) => { self.code.push(Op::PushFloat(*f)); true }
-            LispVal::Bool(b) => { self.code.push(Op::PushBool(*b)); true }
-            LispVal::Str(s) => { self.code.push(Op::PushStr(s.clone())); true }
-            LispVal::Nil => { self.code.push(Op::PushNil); true }
+            LispVal::Num(n) => {
+                self.code.push(Op::PushI64(*n));
+                true
+            }
+            LispVal::Float(f) => {
+                self.code.push(Op::PushFloat(*f));
+                true
+            }
+            LispVal::Bool(b) => {
+                self.code.push(Op::PushBool(*b));
+                true
+            }
+            LispVal::Str(s) => {
+                self.code.push(Op::PushStr(s.clone()));
+                true
+            }
+            LispVal::Nil => {
+                self.code.push(Op::PushNil);
+                true
+            }
             LispVal::Sym(name) => {
                 if let Some(slot) = self.slot_of(name) {
                     self.code.push(Op::LoadSlot(slot));
@@ -166,20 +198,33 @@ impl LoopCompiler {
                     false
                 }
             }
-            LispVal::List(list) if list.is_empty() => { self.code.push(Op::PushNil); true }
+            LispVal::List(list) if list.is_empty() => {
+                self.code.push(Op::PushNil);
+                true
+            }
             LispVal::List(list) => {
                 if let LispVal::Sym(op) = &list[0] {
                     match op.as_str() {
                         // Variadic arithmetic: chain binary ops
                         "+" | "-" | "*" | "/" | "%" => {
                             let opcode = match op.as_str() {
-                                "+" => Op::Add, "-" => Op::Sub, "*" => Op::Mul,
-                                "/" => Op::Div, "%" => Op::Mod, _ => unreachable!(),
+                                "+" => Op::Add,
+                                "-" => Op::Sub,
+                                "*" => Op::Mul,
+                                "/" => Op::Div,
+                                "%" => Op::Mod,
+                                _ => unreachable!(),
                             };
-                            if list.len() < 3 { return false; }
-                            if !self.compile_expr(&list[1], outer_env) { return false; }
+                            if list.len() < 3 {
+                                return false;
+                            }
+                            if !self.compile_expr(&list[1], outer_env) {
+                                return false;
+                            }
                             for arg in &list[2..] {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                                 self.code.push(opcode.clone());
                             }
                             true
@@ -187,39 +232,66 @@ impl LoopCompiler {
                         // Variadic comparison: chain binary ops
                         "=" | "<" | "<=" | ">" | ">=" => {
                             let opcode = match op.as_str() {
-                                "=" => Op::Eq, "<" => Op::Lt, "<=" => Op::Le,
-                                ">" => Op::Gt, ">=" => Op::Ge, _ => unreachable!(),
+                                "=" => Op::Eq,
+                                "<" => Op::Lt,
+                                "<=" => Op::Le,
+                                ">" => Op::Gt,
+                                ">=" => Op::Ge,
+                                _ => unreachable!(),
                             };
-                            if list.len() < 3 { return false; }
-                            if !self.compile_expr(&list[1], outer_env) { return false; }
+                            if list.len() < 3 {
+                                return false;
+                            }
+                            if !self.compile_expr(&list[1], outer_env) {
+                                return false;
+                            }
                             for arg in &list[2..] {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                                 self.code.push(opcode.clone());
                             }
                             true
                         }
                         "not" => {
-                            let arg = match list.get(1) { Some(a) => a, None => return false };
-                            if !self.compile_expr(arg, outer_env) { return false; }
+                            let arg = match list.get(1) {
+                                Some(a) => a,
+                                None => return false,
+                            };
+                            if !self.compile_expr(arg, outer_env) {
+                                return false;
+                            }
                             self.code.push(Op::PushBool(false));
                             self.code.push(Op::Eq);
                             true
                         }
                         // Nested if: (if test then else) — compiles to jump instructions
                         "if" => {
-                            let test = match list.get(1) { Some(t) => t, None => return false };
-                            let then_branch = match list.get(2) { Some(t) => t, None => return false };
+                            let test = match list.get(1) {
+                                Some(t) => t,
+                                None => return false,
+                            };
+                            let then_branch = match list.get(2) {
+                                Some(t) => t,
+                                None => return false,
+                            };
                             let else_branch = list.get(3);
-                            if !self.compile_expr(test, outer_env) { return false; }
+                            if !self.compile_expr(test, outer_env) {
+                                return false;
+                            }
                             let jf_idx = self.code.len();
                             self.code.push(Op::JumpIfFalse(0));
-                            if !self.compile_expr(then_branch, outer_env) { return false; }
+                            if !self.compile_expr(then_branch, outer_env) {
+                                return false;
+                            }
                             let jmp_idx = self.code.len();
                             self.code.push(Op::Jump(0));
                             let else_start = self.code.len();
                             self.code[jf_idx] = Op::JumpIfFalse(else_start);
                             if let Some(ee) = else_branch {
-                                if !self.compile_expr(ee, outer_env) { return false; }
+                                if !self.compile_expr(ee, outer_env) {
+                                    return false;
+                                }
                             } else {
                                 self.code.push(Op::PushNil);
                             }
@@ -229,9 +301,13 @@ impl LoopCompiler {
                         // recur: compile args, emit Recur(N) — valid in any tail position
                         "recur" => {
                             let num_slots = self.slot_map.len();
-                            if list.len() - 1 != num_slots { return false; }
+                            if list.len() - 1 != num_slots {
+                                return false;
+                            }
                             for arg in &list[1..] {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                             }
                             self.code.push(Op::Recur(num_slots));
                             true
@@ -239,10 +315,14 @@ impl LoopCompiler {
                         // and: short-circuit, returns first falsy or last value
                         // Pattern: compile arg; Dup; JumpIfFalse(end); Pop; ...next arg...
                         "and" => {
-                            if list.len() < 2 { return false; }
+                            if list.len() < 2 {
+                                return false;
+                            }
                             let mut jump_patches: Vec<usize> = Vec::new();
                             for (i, arg) in list[1..].iter().enumerate() {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                                 if i + 1 < list.len() - 1 {
                                     self.code.push(Op::Dup);
                                     let jf_idx = self.code.len();
@@ -259,10 +339,14 @@ impl LoopCompiler {
                         }
                         // or: short-circuit, returns first truthy or last value
                         "or" => {
-                            if list.len() < 2 { return false; }
+                            if list.len() < 2 {
+                                return false;
+                            }
                             let mut jump_patches: Vec<usize> = Vec::new();
                             for (i, arg) in list[1..].iter().enumerate() {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                                 if i + 1 < list.len() - 1 {
                                     self.code.push(Op::Dup);
                                     let jt_idx = self.code.len();
@@ -284,7 +368,9 @@ impl LoopCompiler {
                                 return true;
                             }
                             for (i, arg) in list[1..].iter().enumerate() {
-                                if !self.compile_expr(arg, outer_env) { return false; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return false;
+                                }
                                 if i + 1 < list.len() - 1 {
                                     self.code.push(Op::Pop);
                                 }
@@ -294,28 +380,38 @@ impl LoopCompiler {
                         // cond: multi-branch — chained JumpIfFalse
                         // (cond (t1 r1) (t2 r2) (else rN))
                         "cond" => {
-                            if list.len() < 2 { return false; }
+                            if list.len() < 2 {
+                                return false;
+                            }
                             let mut end_jumps: Vec<usize> = Vec::new();
                             let mut i = 1;
                             while i < list.len() {
                                 let clause = match list.get(i) {
                                     Some(LispVal::List(c)) if c.len() >= 2 => c.clone(),
-                                    _ => { return false; }
+                                    _ => {
+                                        return false;
+                                    }
                                 };
                                 // else clause — just compile result
                                 if clause[0] == LispVal::Sym("else".into()) {
-                                    if !self.compile_expr(&clause[1], outer_env) { return false; }
+                                    if !self.compile_expr(&clause[1], outer_env) {
+                                        return false;
+                                    }
                                     break;
                                 }
                                 // compile test
-                                if !self.compile_expr(&clause[0], outer_env) { return false; }
+                                if !self.compile_expr(&clause[0], outer_env) {
+                                    return false;
+                                }
                                 let jf_idx = self.code.len();
                                 self.code.push(Op::JumpIfFalse(0)); // placeholder
-                                // compile result
-                                if !self.compile_expr(&clause[1], outer_env) { return false; }
+                                                                    // compile result
+                                if !self.compile_expr(&clause[1], outer_env) {
+                                    return false;
+                                }
                                 end_jumps.push(self.code.len());
                                 self.code.push(Op::Jump(0)); // jump to end
-                                // patch JF to skip to next clause
+                                                             // patch JF to skip to next clause
                                 self.code[jf_idx] = Op::JumpIfFalse(self.code.len());
                                 i += 1;
                             }
@@ -330,14 +426,20 @@ impl LoopCompiler {
                             if list.len() > 1 {
                                 let n_args = list.len() - 1;
                                 for arg in &list[1..] {
-                                    if !self.compile_expr(arg, outer_env) { return false; }
+                                    if !self.compile_expr(arg, outer_env) {
+                                        return false;
+                                    }
                                 }
                                 self.code.push(Op::BuiltinCall(op.clone(), n_args));
                                 true
-                            } else { false }
+                            } else {
+                                false
+                            }
                         }
                     }
-                } else { false }
+                } else {
+                    false
+                }
             }
             _ => false,
         }
@@ -358,37 +460,136 @@ impl LoopCompiler {
                 let then_branch = parts.get(2)?;
                 let else_branch = parts.get(3);
 
-                if !self.compile_expr(test, outer_env) { return None; }
-                let jf_idx = self.code.len();
-                self.code.push(Op::JumpIfFalse(0));
-                if !self.compile_expr(then_branch, outer_env) { return None; }
-                self.code.push(Op::Return);
-                let else_start = self.code.len();
-                self.code[jf_idx] = Op::JumpIfFalse(else_start);
+                // --- Mega-fuse: detect classic (if (>= counter limit) accum (recur (+ counter step) (+ accum counter))) ---
+                if num_slots == 2 {
+                    if let (
+                        &LispVal::List(ref test_parts),
+                        &LispVal::Sym(ref then_name),
+                        Some(&LispVal::List(ref else_parts)),
+                    ) = (test, then_branch, else_branch) {
+                        // test_parts = [">=", counter_sym, limit_num]
+                        // else_parts = ["recur", (+ counter step), (+ accum counter)]
+                        if test_parts.len() == 3
+                            && test_parts[0] == LispVal::Sym(">=".into())
+                            && else_parts.len() == 3
+                            && else_parts[0] == LispVal::Sym("recur".into())
+                        {
+                            if let (
+                                LispVal::Sym(ref counter_name),
+                                LispVal::Num(limit),
+                            ) = (&test_parts[1], &test_parts[2])
+                            {
+                                let recur_args = &else_parts[1..];
+                                if let (
+                                    LispVal::List(ref arg1),
+                                    LispVal::List(ref arg2),
+                                ) = (&recur_args[0], &recur_args[1])
+                                {
+                                    if arg1.len() == 3 && arg2.len() == 3
+                                        && arg1[0] == LispVal::Sym("+".into())
+                                        && arg2[0] == LispVal::Sym("+".into())
+                                    {
+                                        if let (
+                                            LispVal::Sym(ref a1_sym),
+                                            LispVal::Num(a1_step),
+                                            LispVal::Sym(ref a2_sym),
+                                            LispVal::Sym(ref a2_rhs),
+                                        ) = (&arg1[1], &arg1[2], &arg2[1], &arg2[2])
+                                        {
+                                            // a1 = counter+step, a2 = accum+counter
+                                            if a1_sym == counter_name
+                                                && a2_sym == then_name
+                                                && a2_rhs == counter_name
+                                                && counter_name != then_name
+                                            {
+                                                if let (Some(cs), Some(as_)) = (
+                                                    self.slot_of(counter_name),
+                                                    self.slot_of(then_name),
+                                                ) {
+                                                    let jf_idx = self.code.len();
+                                                    self.code.push(Op::JumpIfSlotGeImm(cs, *limit, 0)); // placeholder
+                                                    self.code.push(Op::RecurIncAccum(cs, as_, *a1_step, *limit, 0)); // placeholder
+                                                    // exit path: LoadSlot(accum), Return — this is what both ops jump to
+                                                    let exit_target = self.code.len();
+                                                    self.code.push(Op::LoadSlot(as_));
+                                                    self.code.push(Op::Return);
+                                                    // Patch: both jump to the LoadSlot instruction
+                                                    self.code[jf_idx] = Op::JumpIfSlotGeImm(cs, *limit, exit_target);
+                                                    self.code[jf_idx + 1] = Op::RecurIncAccum(cs, as_, *a1_step, *limit, exit_target);
 
+                                                    let captured = self.captured.clone();
+                                                    let code = self.code;
+                                                    return Some(CompiledLoop {
+                                                        num_slots,
+                                                        slot_names: self.slot_map,
+                                                        init_vals,
+                                                        code,
+                                                        loop_start_pc: 0,
+                                                        captured,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- Generic if/recur compilation (fallback) ---
+                // Emit else/recur FIRST so peephole sees contiguous window:
+                //   test → JumpIfTrue(then_start) → recur args → Recur → then → Return
+                if !self.compile_expr(test, outer_env) {
+                    return None;
+                }
+                let jt_idx = self.code.len();
+                self.code.push(Op::JumpIfTrue(0)); // placeholder: jump to then when test is true (done)
+
+                // Recur body (else branch) — comes right after condition for contiguous peephole
                 if let Some(else_expr) = else_branch {
                     if let LispVal::List(else_parts) = else_expr {
                         if else_parts.first() == Some(&LispVal::Sym("recur".into())) {
                             let recur_args = &else_parts[1..];
-                            if recur_args.len() != num_slots { return None; }
+                            if recur_args.len() != num_slots {
+                                return None;
+                            }
                             for arg in recur_args {
-                                if !self.compile_expr(arg, outer_env) { return None; }
+                                if !self.compile_expr(arg, outer_env) {
+                                    return None;
+                                }
                             }
                             self.code.push(Op::Recur(num_slots));
                         } else {
-                            if !self.compile_expr(else_expr, outer_env) { return None; }
+                            if !self.compile_expr(else_expr, outer_env) {
+                                return None;
+                            }
                             self.code.push(Op::Return);
                         }
                     } else {
-                        if !self.compile_expr(else_expr, outer_env) { return None; }
+                        if !self.compile_expr(else_expr, outer_env) {
+                            return None;
+                        }
                         self.code.push(Op::Return);
                     }
                 } else {
                     self.code.push(Op::PushNil);
                     self.code.push(Op::Return);
                 }
+
+                // Then branch — at the end, jumped to when loop is done
+                let then_start = self.code.len();
+                self.code[jt_idx] = Op::JumpIfTrue(then_start);
+                if !self.compile_expr(then_branch, outer_env) {
+                    return None;
+                }
+                self.code.push(Op::Return);
                 let captured = self.captured.clone();
                 let mut code = self.code;
+                peephole_optimize(&mut code);
+                // Second pass: now that 3-op and 2-op fusions are done, check for mega-fuse
+                peephole_optimize(&mut code);
+                // Third pass: 2-op fusion may have created new JumpIfSlotCmpImm for mega-fuse
                 peephole_optimize(&mut code);
                 return Some(CompiledLoop {
                     num_slots,
@@ -399,10 +600,16 @@ impl LoopCompiler {
                     captured,
                 });
             }
-            if !self.compile_expr(body, outer_env) { return None; }
+            if !self.compile_expr(body, outer_env) {
+                return None;
+            }
             self.code.push(Op::Return);
             let captured = self.captured.clone();
             let mut code = self.code;
+            peephole_optimize(&mut code);
+            // Second pass: now that 3-op and 2-op fusions are done, check for mega-fuse
+            peephole_optimize(&mut code);
+            // Third pass: 2-op fusion may have created new JumpIfSlotCmpImm for mega-fuse
             peephole_optimize(&mut code);
             return Some(CompiledLoop {
                 num_slots,
@@ -418,7 +625,8 @@ impl LoopCompiler {
 }
 
 /// Peephole optimizer: fuse LoadSlot + PushI64 + Arith/Cmp sequences,
-/// convert small Recur → RecurDirect, and remap jump targets.
+/// convert small Recur → RecurDirect, fuse SlotCmpImm + JumpIfFalse,
+/// and remap jump targets.
 fn peephole_optimize(code: &mut Vec<Op>) {
     let mut i = 0;
     let mut new_code = Vec::with_capacity(code.len());
@@ -426,6 +634,55 @@ fn peephole_optimize(code: &mut Vec<Op>) {
     let mut index_map: Vec<usize> = Vec::with_capacity(code.len());
     while i < code.len() {
         index_map.push(new_code.len());
+
+        // --- Mega-fuse: 6 ops → 1 for the classic sum loop pattern ---
+        // JumpIfSlot*CmpImm(counter, limit, exit)
+        // SlotAddImm(counter, step)
+        // LoadSlot(accum)
+        // LoadSlot(counter)
+        // Add
+        // RecurDirect(2)
+        // → RecurIncAccum(counter, accum, step, adjusted_limit, exit)
+        // where adjusted_limit accounts for the comparison type:
+        //   Ge: limit as-is, Gt: limit+1, Le: limit+1, Lt: limit, Eq: limit
+        if i + 5 < code.len() {
+            // Extract the counter, limit, and exit from any comparison variant
+            let cmp_info: Option<(usize, i64, usize)> = match &code[i] {
+                Op::JumpIfSlotGeImm(s, imm, addr) => Some((*s, *imm, *addr)),   // >= imm → exit at >= imm
+                Op::JumpIfSlotGtImm(s, imm, addr) => Some((*s, imm + 1, *addr)), // > imm → exit at >= imm+1
+                Op::JumpIfSlotLeImm(s, imm, addr) => Some((*s, imm + 1, *addr)), // <= imm → exit at >= imm+1
+                Op::JumpIfSlotLtImm(s, imm, addr) => Some((*s, *imm, *addr)),    // < imm → exit at >= imm
+                Op::JumpIfSlotEqImm(s, imm, addr) => Some((*s, *imm, *addr)),    // == imm → exit at >= imm (approx)
+                _ => None,
+            };
+            if let Some((counter, limit, exit)) = cmp_info {
+                if let (
+                    Op::SlotAddImm(cs, step),
+                    Op::LoadSlot(accum),
+                    Op::LoadSlot(as2),
+                    Op::Add,
+                    Op::RecurDirect(n),
+                ) = (
+                    &code[i + 1], &code[i + 2], &code[i + 3], &code[i + 4], &code[i + 5],
+                ) {
+                    // counter slot must be consistent, n==2 slots, accum != counter,
+                    // and second LoadSlot loads the counter (accum += counter)
+                    if *n == 2 && counter == *cs && *accum != counter && *as2 == counter {
+                        // 6 ops consumed (indices i..i+5); first index_map entry already pushed at top of loop
+                        // Push index_map entries for the remaining 5 consumed ops
+                        for _ in 0..5 {
+                            index_map.push(new_code.len());
+                        }
+                        new_code.push(Op::RecurIncAccum(
+                            counter, *accum, *step, limit, exit,
+                        ));
+                        i += 6;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // Try to fuse LoadSlot(s) + PushI64(imm) + Arith/Cmp
         if i + 2 < code.len() {
             if let (Op::LoadSlot(s), Op::PushI64(imm)) = (&code[i], &code[i + 1]) {
@@ -451,6 +708,34 @@ fn peephole_optimize(code: &mut Vec<Op>) {
                     i += 3;
                     continue;
                 }
+            }
+        }
+        // Try to fuse SlotCmpImm(s, imm) + JumpIfTrue(addr)
+        // JumpIfTrue: jump when condition is true → fused op matches its name directly
+        if i + 1 < code.len() {
+            let fused = match (&code[i], &code[i + 1]) {
+                (Op::SlotLtImm(s, imm), Op::JumpIfTrue(addr)) => {
+                    Some(Op::JumpIfSlotLtImm(*s, *imm, *addr))
+                }
+                (Op::SlotLeImm(s, imm), Op::JumpIfTrue(addr)) => {
+                    Some(Op::JumpIfSlotLeImm(*s, *imm, *addr))
+                }
+                (Op::SlotGtImm(s, imm), Op::JumpIfTrue(addr)) => {
+                    Some(Op::JumpIfSlotGtImm(*s, *imm, *addr))
+                }
+                (Op::SlotGeImm(s, imm), Op::JumpIfTrue(addr)) => {
+                    Some(Op::JumpIfSlotGeImm(*s, *imm, *addr))
+                }
+                (Op::SlotEqImm(s, imm), Op::JumpIfTrue(addr)) => {
+                    Some(Op::JumpIfSlotEqImm(*s, *imm, *addr))
+                }
+                _ => None,
+            };
+            if let Some(op) = fused {
+                index_map.push(new_code.len());
+                new_code.push(op);
+                i += 2;
+                continue;
             }
         }
         // Convert Recur(n) with n <= 4 to RecurDirect(n)
@@ -479,6 +764,16 @@ fn remap_jump_target(op: &mut Op, index_map: &[usize]) {
                 *addr = index_map[*addr];
             }
         }
+        Op::JumpIfSlotLtImm(_, _, addr)
+        | Op::JumpIfSlotLeImm(_, _, addr)
+        | Op::JumpIfSlotGtImm(_, _, addr)
+        | Op::JumpIfSlotGeImm(_, _, addr)
+        | Op::JumpIfSlotEqImm(_, _, addr)
+        | Op::RecurIncAccum(_, _, _, _, addr) => {
+            if *addr < index_map.len() {
+                *addr = index_map[*addr];
+            }
+        }
         _ => {}
     }
 }
@@ -500,8 +795,6 @@ fn run_compiled_loop(
     let mut pc: usize = 0;
 
     loop {
-        check_gas(gas)?;
-
         match &code[pc] {
             Op::LoadSlot(s) => {
                 // Num fast path: avoid full Clone for the common case
@@ -567,14 +860,18 @@ fn run_compiled_loop(
             Op::Div => {
                 let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
                 let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
-                if b == 0 { return Err("division by zero".into()); }
+                if b == 0 {
+                    return Err("division by zero".into());
+                }
                 stack.push(LispVal::Num(a / b));
                 pc += 1;
             }
             Op::Mod => {
                 let b = num_val(stack.pop().unwrap_or(LispVal::Nil));
                 let a = num_val(stack.pop().unwrap_or(LispVal::Nil));
-                if b == 0 { return Err("modulo by zero".into()); }
+                if b == 0 {
+                    return Err("modulo by zero".into());
+                }
                 stack.push(LispVal::Num(a % b));
                 pc += 1;
             }
@@ -610,13 +907,23 @@ fn run_compiled_loop(
             }
             Op::JumpIfTrue(addr) => {
                 let v = stack.pop().unwrap_or(LispVal::Nil);
-                if is_truthy(&v) { pc = *addr; } else { pc += 1; }
+                if is_truthy(&v) {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
             }
             Op::JumpIfFalse(addr) => {
                 let v = stack.pop().unwrap_or(LispVal::Nil);
-                if !is_truthy(&v) { pc = *addr; } else { pc += 1; }
+                if !is_truthy(&v) {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
             }
-            Op::Jump(addr) => { pc = *addr; }
+            Op::Jump(addr) => {
+                pc = *addr;
+            }
             Op::Return => {
                 return Ok(stack.pop().unwrap_or(LispVal::Nil));
             }
@@ -638,14 +945,14 @@ fn run_compiled_loop(
             Op::SlotAddImm(s, imm) => {
                 let v = num_val_ref(&slots[*s]);
                 let result = v + imm;
-                slots[*s] = LispVal::Num(result);
+                // DON'T write back to slot — Recur/RecurDirect pops from stack
                 stack.push(LispVal::Num(result));
                 pc += 1;
             }
             Op::SlotSubImm(s, imm) => {
                 let v = num_val_ref(&slots[*s]);
                 let result = v - imm;
-                slots[*s] = LispVal::Num(result);
+                // DON'T write back to slot — Recur/RecurDirect pops from stack
                 stack.push(LispVal::Num(result));
                 pc += 1;
             }
@@ -655,7 +962,9 @@ fn run_compiled_loop(
                 pc += 1;
             }
             Op::SlotDivImm(s, imm) => {
-                if *imm == 0 { return Err("division by zero".into()); }
+                if *imm == 0 {
+                    return Err("division by zero".into());
+                }
                 let v = num_val_ref(&slots[*s]);
                 stack.push(LispVal::Num(v / imm));
                 pc += 1;
@@ -684,6 +993,60 @@ fn run_compiled_loop(
                 let v = num_val_ref(&slots[*s]);
                 stack.push(LispVal::Bool(v >= *imm));
                 pc += 1;
+            }
+            // --- Super-fused: cmp + jump without stack traffic ---
+            Op::JumpIfSlotLtImm(s, imm, addr) => {
+                let v = num_val_ref(&slots[*s]);
+                if v < *imm {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
+            }
+            Op::JumpIfSlotLeImm(s, imm, addr) => {
+                let v = num_val_ref(&slots[*s]);
+                if v <= *imm {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
+            }
+            Op::JumpIfSlotGtImm(s, imm, addr) => {
+                let v = num_val_ref(&slots[*s]);
+                if v > *imm {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
+            }
+            Op::JumpIfSlotGeImm(s, imm, addr) => {
+                let v = num_val_ref(&slots[*s]);
+                if v >= *imm {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
+            }
+            Op::JumpIfSlotEqImm(s, imm, addr) => {
+                let v = num_val_ref(&slots[*s]);
+                if v == *imm {
+                    pc = *addr;
+                } else {
+                    pc += 1;
+                }
+            }
+            // --- Mega-fused: entire loop body in one op ---
+            // RecurIncAccum(counter_slot, accum_slot, step, limit, exit_addr)
+            Op::RecurIncAccum(counter, accum, step, limit, exit_addr) => {
+                let cv = num_val_ref(&slots[*counter]);
+                if cv >= *limit {
+                    pc = *exit_addr;
+                } else {
+                    let av = num_val_ref(&slots[*accum]);
+                    slots[*accum] = LispVal::Num(av + cv);
+                    slots[*counter] = LispVal::Num(cv + step);
+                    pc = 0; // jump to loop start
+                }
             }
             Op::BuiltinCall(name, n_args) => {
                 let mut args: Vec<LispVal> = Vec::with_capacity(*n_args);
@@ -733,7 +1096,9 @@ pub fn lisp_eq(a: &LispVal, b: &LispVal) -> bool {
 /// Evaluate a builtin by name (for Op::BuiltinCall)
 pub fn eval_builtin(name: &str, args: &[LispVal]) -> Result<LispVal, String> {
     match name {
-        "abs" => Ok(LispVal::Num(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)).abs())),
+        "abs" => Ok(LispVal::Num(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)).abs(),
+        )),
         "min" => {
             let a = num_val(args.get(0).cloned().unwrap_or(LispVal::Nil));
             let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
@@ -744,8 +1109,13 @@ pub fn eval_builtin(name: &str, args: &[LispVal]) -> Result<LispVal, String> {
             let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
             Ok(LispVal::Num(a.max(b)))
         }
-        "to-string" => Ok(LispVal::Str(format!("{}", args.get(0).unwrap_or(&LispVal::Nil)))),
-        "str" => Ok(LispVal::Str(args.iter().map(|a| format!("{}", a)).collect())),
+        "to-string" => Ok(LispVal::Str(format!(
+            "{}",
+            args.get(0).unwrap_or(&LispVal::Nil)
+        ))),
+        "str" => Ok(LispVal::Str(
+            args.iter().map(|a| format!("{}", a)).collect(),
+        )),
         "car" => match args.get(0) {
             Some(LispVal::List(l)) => Ok(l.first().cloned().unwrap_or(LispVal::Nil)),
             _ => Ok(LispVal::Nil),
@@ -773,21 +1143,39 @@ pub fn eval_builtin(name: &str, args: &[LispVal]) -> Result<LispVal, String> {
             Some(LispVal::Nil) => Ok(LispVal::Bool(true)),
             _ => Ok(LispVal::Bool(false)),
         },
-        "zero?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) == 0)),
-        "pos?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) > 0)),
-        "neg?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) < 0)),
+        "zero?" => Ok(LispVal::Bool(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) == 0,
+        )),
+        "pos?" => Ok(LispVal::Bool(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) > 0,
+        )),
+        "neg?" => Ok(LispVal::Bool(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) < 0,
+        )),
         "mod" => {
             let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
-            if b == 0 { return Err("mod by zero".into()); }
-            Ok(LispVal::Num(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b))
+            if b == 0 {
+                return Err("mod by zero".into());
+            }
+            Ok(LispVal::Num(
+                num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b,
+            ))
         }
         "remainder" => {
             let b = num_val(args.get(1).cloned().unwrap_or(LispVal::Nil));
-            if b == 0 { return Err("remainder by zero".into()); }
-            Ok(LispVal::Num(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b))
+            if b == 0 {
+                return Err("remainder by zero".into());
+            }
+            Ok(LispVal::Num(
+                num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % b,
+            ))
         }
-        "even?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 == 0)),
-        "odd?" => Ok(LispVal::Bool(num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 != 0)),
+        "even?" => Ok(LispVal::Bool(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 == 0,
+        )),
+        "odd?" => Ok(LispVal::Bool(
+            num_val(args.get(0).cloned().unwrap_or(LispVal::Nil)) % 2 != 0,
+        )),
         _ => Err(format!("loop bytecode: unknown builtin '{}'", name)),
     }
 }

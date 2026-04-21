@@ -5,7 +5,6 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -105,7 +104,10 @@ pub struct Env {
 
 impl Env {
     pub fn new() -> Self {
-        Env { bindings: Vec::new(), index: HashMap::new() }
+        Env {
+            bindings: Vec::new(),
+            index: HashMap::new(),
+        }
     }
 
     /// Build an Env from a flat vec of bindings (used by tests + resume_eval).
@@ -134,9 +136,13 @@ impl Env {
         self.index.contains_key(name)
     }
 
-    pub fn len(&self) -> usize { self.bindings.len() }
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
     #[allow(clippy::len_without_is_empty)]
-    pub fn is_empty(&self) -> bool { self.bindings.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
 
     pub fn truncate(&mut self, new_len: usize) {
         for i in (new_len..self.bindings.len()).rev() {
@@ -173,7 +179,9 @@ impl Env {
         self.bindings.iter_mut()
     }
 
-    pub fn into_bindings(self) -> Vec<(String, LispVal)> { self.bindings }
+    pub fn into_bindings(self) -> Vec<(String, LispVal)> {
+        self.bindings
+    }
 
     pub fn clear(&mut self) {
         self.bindings.clear();
@@ -203,7 +211,7 @@ pub enum LispVal {
     List(Vec<LispVal>),
     Lambda {
         params: Vec<String>,
-        rest_param: Option<String>,  // &rest parameter name, collects remaining args as list
+        rest_param: Option<String>, // &rest parameter name, collects remaining args as list
         body: Box<LispVal>,
         closed_env: Box<Vec<(String, LispVal)>>,
     },
@@ -247,4 +255,3 @@ impl std::fmt::Display for LispVal {
         }
     }
 }
-

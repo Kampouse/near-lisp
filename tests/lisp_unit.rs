@@ -385,7 +385,10 @@ fn test_run_program_multiple_top_level_only_first_ccall_yields() {
             assert_eq!(yields.len(), 2);
             assert_eq!(yields[0].account, "x.near");
             assert_eq!(yields[1].account, "y.near");
-            assert_eq!(state.pending_vars, vec![Some("a".to_string()), Some("b".to_string())]);
+            assert_eq!(
+                state.pending_vars,
+                vec![Some("a".to_string()), Some("b".to_string())]
+            );
             assert_eq!(state.remaining.len(), 0); // both ccalls consumed
         }
         RunResult::Done(_) => panic!("Expected Yield"),
@@ -570,7 +573,7 @@ fn test_multi_ccall_standalone_ccall_chain() {
             assert_eq!(yields[0].account, "oracle.near");
             assert_eq!(yields[0].method, "get1");
             assert_eq!(state.pending_vars, vec![None]); // standalone
-            // remaining = (near/ccall-result) + ccall + ccall-result
+                                                        // remaining = (near/ccall-result) + ccall + ccall-result
             assert_eq!(state.remaining.len(), 3);
             state
         }
@@ -1132,26 +1135,42 @@ fn test_to_num() {
 #[test]
 fn test_to_num_invalid() {
     let result = eval_str("(to-num \"hello\")");
-    assert!(result.contains("ERROR"), "to-num on string should error: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "to-num on string should error: {}",
+        result
+    );
 }
 
 #[test]
 fn test_error_builtin() {
     let result = eval_str("(error \"something broke\")");
-    assert!(result.contains("something"), "error should contain message: {}", result);
+    assert!(
+        result.contains("something"),
+        "error should contain message: {}",
+        result
+    );
 }
 
 #[test]
 fn test_error_builtin_no_args() {
     let result = eval_str("(error)");
-    assert!(result.contains("error"), "error with no args should return error: {}", result);
+    assert!(
+        result.contains("error"),
+        "error with no args should return error: {}",
+        result
+    );
 }
 
 #[test]
 fn test_error_catchable() {
     let code = r#"(try (error "boom") (catch e (str-concat "caught: " e)))"#;
     let result = eval_str(code);
-    assert!(result.contains("caught:"), "error should be catchable: {}", result);
+    assert!(
+        result.contains("caught:"),
+        "error should be catchable: {}",
+        result
+    );
 }
 
 #[test]
@@ -1642,7 +1661,10 @@ fn test_ccall_call_yields_with_deposit_and_gas() {
     match result {
         near_lisp::RunResult::Yield { yields, .. } => {
             assert_eq!(yields.len(), 1);
-            assert_eq!(yields[0].deposit, 1000000, "ccall-call deposit should be 1000000");
+            assert_eq!(
+                yields[0].deposit, 1000000,
+                "ccall-call deposit should be 1000000"
+            );
             assert_eq!(yields[0].gas_tgas, 100, "ccall-call gas should be 100 TGas");
             assert_eq!(yields[0].account, "x.near");
             assert_eq!(yields[0].method, "f");
@@ -2274,7 +2296,11 @@ fn test_nth_last() {
 #[test]
 fn test_nth_out_of_bounds() {
     let result = eval_str("(nth 5 (list 1 2 3))");
-    assert!(result.contains("ERROR") || result == "nil", "out of bounds: {}", result);
+    assert!(
+        result.contains("ERROR") || result == "nil",
+        "out of bounds: {}",
+        result
+    );
 }
 
 // --- str-contains (comprehensive) ---
@@ -2425,7 +2451,10 @@ fn test_sort_nil() {
 // --- zip ---
 #[test]
 fn test_zip_basic() {
-    assert_eq!(eval_str("(zip (list 1 2 3) (list 4 5 6))"), "((1 4) (2 5) (3 6))");
+    assert_eq!(
+        eval_str("(zip (list 1 2 3) (list 4 5 6))"),
+        "((1 4) (2 5) (3 6))"
+    );
 }
 
 #[test]
@@ -2471,12 +2500,18 @@ fn test_find_first_match() {
 // --- some ---
 #[test]
 fn test_some_true() {
-    assert_eq!(eval_str("(some (lambda (x) (> x 3)) (list 1 2 5 3))"), "true");
+    assert_eq!(
+        eval_str("(some (lambda (x) (> x 3)) (list 1 2 5 3))"),
+        "true"
+    );
 }
 
 #[test]
 fn test_some_false() {
-    assert_eq!(eval_str("(some (lambda (x) (> x 10)) (list 1 2 3))"), "false");
+    assert_eq!(
+        eval_str("(some (lambda (x) (> x 10)) (list 1 2 3))"),
+        "false"
+    );
 }
 
 #[test]
@@ -2487,12 +2522,18 @@ fn test_some_empty() {
 // --- every ---
 #[test]
 fn test_every_true() {
-    assert_eq!(eval_str("(every (lambda (x) (> x 0)) (list 1 2 3))"), "true");
+    assert_eq!(
+        eval_str("(every (lambda (x) (> x 0)) (list 1 2 3))"),
+        "true"
+    );
 }
 
 #[test]
 fn test_every_false() {
-    assert_eq!(eval_str("(every (lambda (x) (> x 2)) (list 1 2 3))"), "false");
+    assert_eq!(
+        eval_str("(every (lambda (x) (> x 2)) (list 1 2 3))"),
+        "false"
+    );
 }
 
 #[test]
@@ -2712,7 +2753,11 @@ fn test_stdlib_string_pad_right() {
 #[test]
 fn test_int_div_by_zero() {
     let result = eval_str("(/ 10 0)");
-    assert!(result.contains("ERROR"), "div by zero should error: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "div by zero should error: {}",
+        result
+    );
 }
 
 // --- Negative modulo ---
@@ -2727,7 +2772,11 @@ fn test_mod_negative_divisor() {
     // Rust rem_euclid: 7 mod -3 — behavior depends on implementation
     // Rust's % gives -2, rem_euclid gives 1
     let result = eval_str("(mod 7 -3)");
-    assert!(result == "1" || result == "-2", "mod with negative divisor: {}", result);
+    assert!(
+        result == "1" || result == "-2",
+        "mod with negative divisor: {}",
+        result
+    );
 }
 
 // --- sort edge cases ---
@@ -2768,7 +2817,11 @@ fn test_empty_string() {
     // empty? only checks nil and empty list
     let result = eval_str("(empty? \"\")");
     // depends on implementation — should be false (not a list/nil)
-    assert!(result == "false" || result == "true", "empty? on string: {}", result);
+    assert!(
+        result == "false" || result == "true",
+        "empty? on string: {}",
+        result
+    );
 }
 
 // --- match deep nesting ---
@@ -2828,14 +2881,22 @@ fn test_to_json_dict_with_list() {
 fn test_try_catch_division_by_zero() {
     let code = r#"(try (/ 1 0) (catch e (str-concat "caught: " e)))"#;
     let result = eval_str(code);
-    assert!(result.contains("caught:"), "should catch div-by-zero: {}", result);
+    assert!(
+        result.contains("caught:"),
+        "should catch div-by-zero: {}",
+        result
+    );
 }
 
 #[test]
 fn test_try_catch_type_error() {
     let code = r#"(try (+ 1 "hello") (catch e (str-concat "caught: " e)))"#;
     let result = eval_str(code);
-    assert!(result.contains("caught:"), "should catch type error: {}", result);
+    assert!(
+        result.contains("caught:"),
+        "should catch type error: {}",
+        result
+    );
 }
 
 // --- dict edge cases ---
@@ -2884,7 +2945,11 @@ fn test_deep_recursion_gas_limit() {
     // Should hit gas limit, not stack overflow
     let code = "(define f (lambda (n) (if (<= n 0) 0 (+ 1 (f (- n 1)))))) (f 10000)";
     let result = eval_str_gas(code, 1_000);
-    assert!(result.contains("ERROR"), "deep recursion should error: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "deep recursion should error: {}",
+        result
+    );
     assert!(result.contains("gas"), "should be gas error: {}", result);
 }
 
@@ -2897,14 +2962,21 @@ fn test_str_concat_empty() {
 
 #[test]
 fn test_str_split_multiple() {
-    assert_eq!(eval_str("(str-split \"a,b,c,d\" \",\")"), "(\"a\" \"b\" \"c\" \"d\")");
+    assert_eq!(
+        eval_str("(str-split \"a,b,c,d\" \",\")"),
+        "(\"a\" \"b\" \"c\" \"d\")"
+    );
 }
 
 #[test]
 fn test_str_substring_out_of_range() {
     let result = eval_str("(str-substring \"hi\" 5 10)");
     // Should either error or return empty
-    assert!(result.contains("ERROR") || result == "\"\"", "substring oob: {}", result);
+    assert!(
+        result.contains("ERROR") || result == "\"\"",
+        "substring oob: {}",
+        result
+    );
 }
 
 // --- crypto: ed25519-verify and ecrecover ---
@@ -2913,14 +2985,22 @@ fn test_str_substring_out_of_range() {
 #[test]
 fn test_ed25519_verify_wrong_length_sig() {
     let result = eval_str("(ed25519-verify \"abcd\" \"msg\" \"abcd\")");
-    assert!(result.contains("ERROR"), "bad sig length should error: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "bad sig length should error: {}",
+        result
+    );
 }
 
 #[test]
 fn test_ed25519_verify_wrong_length_pk() {
     // 128 hex char sig (64 bytes), but short pk
     let result = eval_str("(ed25519-verify \"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\" \"msg\" \"abcd\")");
-    assert!(result.contains("ERROR"), "bad pk length should error: {}", result);
+    assert!(
+        result.contains("ERROR"),
+        "bad pk length should error: {}",
+        result
+    );
 }
 
 #[test]
@@ -2944,14 +3024,17 @@ fn test_ecrecover_wrong_sig_length() {
 
 #[test]
 fn test_variadic_sum() {
-    assert_eq!(eval_str("(define sum (lambda (&rest args) (reduce + 0 args))) (sum 1 2 3 4 5)"), "15");
+    assert_eq!(
+        eval_str("(define sum (lambda (&rest args) (reduce + 0 args))) (sum 1 2 3 4 5)"),
+        "15"
+    );
 }
 
 #[test]
 fn test_variadic_with_fixed_params() {
     assert_eq!(
         eval_str("(define f (lambda (a b &rest rest) (+ a b (len rest)))) (f 1 2 3 4 5)"),
-        "6"  // 1 + 2 + 3 (length of rest [3,4,5])
+        "6" // 1 + 2 + 3 (length of rest [3,4,5])
     );
 }
 
@@ -2974,7 +3057,7 @@ fn test_variadic_list_capture() {
 #[test]
 fn test_variadic_inline_lambda() {
     let code = "((lambda (x &rest rest) (+ x (len rest))) 10 20 30 40)";
-    assert_eq!(eval_str(code), "13");  // 10 + 3 (length of rest)
+    assert_eq!(eval_str(code), "13"); // 10 + 3 (length of rest)
 }
 
 // --- Nested match destructuring ---
@@ -3001,7 +3084,10 @@ fn test_match_triple_nested() {
 
 #[test]
 fn test_match_wildcard_else() {
-    assert_eq!(eval_str(r#"(match 42 (1 "one") (else "other"))"#), "\"other\"");
+    assert_eq!(
+        eval_str(r#"(match 42 (1 "one") (else "other"))"#),
+        "\"other\""
+    );
 }
 
 // --- Inspect builtin ---
@@ -3017,7 +3103,7 @@ fn test_inspect_number() {
 fn test_inspect_list() {
     let result = eval_str("(inspect (list 1 2 3))");
     assert!(result.contains("list"), "inspect list: {}", result);
-    assert!(result.contains("3"), "should show length: {}", result);  // list[3]
+    assert!(result.contains("3"), "should show length: {}", result); // list[3]
 }
 
 #[test]

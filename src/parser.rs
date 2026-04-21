@@ -5,7 +5,6 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
 use crate::types::LispVal;
 
 // ---------------------------------------------------------------------------
@@ -134,4 +133,3 @@ pub fn parse_all(input: &str) -> Result<Vec<LispVal>, String> {
     }
     Ok(exprs)
 }
-

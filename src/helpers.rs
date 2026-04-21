@@ -5,8 +5,7 @@ use near_sdk::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-
-use crate::types::{LispVal, Env};
+use crate::types::{Env, LispVal};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -194,7 +193,6 @@ pub fn parse_params(val: &LispVal) -> Result<(Vec<String>, Option<String>), Stri
 
 // NOTE: apply_lambda moved to eval.rs (avoids circular dep: helpers→eval→helpers)
 
-
 // ---------------------------------------------------------------------------
 // Pattern matching helper
 // ---------------------------------------------------------------------------
@@ -202,7 +200,7 @@ pub fn parse_params(val: &LispVal) -> Result<(Vec<String>, Option<String>), Stri
 pub fn match_pattern(pattern: &LispVal, value: &LispVal) -> Option<Vec<(String, LispVal)>> {
     match pattern {
         LispVal::Sym(s) if s == "_" => Some(vec![]),
-        LispVal::Sym(s) if s == "else" => Some(vec![]),  // else is wildcard in match
+        LispVal::Sym(s) if s == "else" => Some(vec![]), // else is wildcard in match
         LispVal::Sym(s) if s.starts_with('?') => {
             // Binding variable — strip the '?' prefix
             Some(vec![(s[1..].to_string(), value.clone())])
@@ -330,4 +328,3 @@ pub fn match_pattern(pattern: &LispVal, value: &LispVal) -> Option<Vec<(String, 
         _ => None,
     }
 }
-

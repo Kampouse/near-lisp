@@ -128,7 +128,10 @@ async fn bench_storage_costs() -> anyhow::Result<()> {
     let tests = vec![
         ("(define x \"hello\")", "1 small def"),
         ("(define x \"hello\")\n(define y \"world\")", "2 small defs"),
-        ("(define x (near/ccall \"x.testnet\" \"foo\" \"{}\"))", "1 ccall def (scan only)"),
+        (
+            "(define x (near/ccall \"x.testnet\" \"foo\" \"{}\"))",
+            "1 ccall def (scan only)",
+        ),
     ];
 
     println!("\n=== Storage/define costs ===");
