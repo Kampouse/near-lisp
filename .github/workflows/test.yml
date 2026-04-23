@@ -1,0 +1,59 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.86.0
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install cargo-near
+        run: cargo install cargo-near --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build WASM
+        run: cargo near build non-reproducible-wasm --no-abi
+
+      - name: Build tests
+        run: cargo build --tests
+
+      - name: Run unit tests
+        run: cargo test --test lisp_unit -- --nocapture
+
+      - name: Run JSON API tests
+        run: cargo test --test lisp_json_api --test lisp_json_edges --test lisp_json_uncovered -- --nocapture
+
+      - name: Run feature tests
+        run: cargo test --test lisp_features --test lisp_floats -- --nocapture
+
+      - name: Run security tests
+        run: cargo test --test lisp_security -- --nocapture
+
+      - name: Run fuzz tests
+        run: cargo test --test lisp_fuzz -- --nocapture
+
+      - name: Run sandbox tests
+        run: cargo test --test lisp_sandbox --test lisp_rebalance --test lisp_execute --test lisp_full_e2e --test lisp_dcl_sandbox -- --nocapture
