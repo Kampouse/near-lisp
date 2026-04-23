@@ -578,8 +578,32 @@ impl LispContract {
             PromiseResult::Successful(data) => borsh::from_slice(&data)
                 .unwrap_or_else(|e| panic!("Failed to deserialize batch results: {}", e)),
             PromiseResult::Failed => {
-                env::storage_remove(yield_id.as_bytes());
-                return "ERROR: ccall batch failed".to_string();
+                // Check if ALL ccalls in this batch are null-safe
+                let all_null_safe = state.null_safe_flags.iter().all(|&f| f);
+                if all_null_safe {
+                    // Return nil for all pending vars
+                    let mut eval_env = state.env;
+                    for i in 0..state.pending_vars.len() {
+                        if let Some(Some(var)) = state.pending_vars.get(i) {
+                            eval_env.push(var.clone(), LispVal::Nil);
+                        }
+                    }
+                    env::storage_remove(yield_id.as_bytes());
+                    // Continue evaluating remaining expressions with nil results
+                    let mut gas = state.gas;
+                    match run_remaining_with_ccall(&state.remaining, &mut eval_env, &mut gas) {
+                        Ok(RunResult::Done(result)) => return result.to_string(),
+                        Ok(RunResult::Yield { yields, state: mut new_state }) => {
+                            new_state.callback = callback;
+                            Self::setup_batch_yield_chain(yields, new_state);
+                            return "YIELDING".to_string();
+                        }
+                        Err(e) => return format!("ERROR: {}", e),
+                    }
+                } else {
+                    env::storage_remove(yield_id.as_bytes());
+                    return "ERROR: ccall batch failed".to_string();
+                }
             }
         };
 

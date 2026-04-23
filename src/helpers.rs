@@ -111,6 +111,7 @@ pub fn as_str(v: &LispVal) -> Result<String, String> {
         LispVal::Str(s) => Ok(s.clone()),
         LispVal::Sym(s) => Ok(s.clone()),
         LispVal::Num(n) => Ok(n.to_string()),
+        LispVal::Float(f) => Ok(f.to_string()),
         _ => Err(format!("expected string, got {}", v)),
     }
 }

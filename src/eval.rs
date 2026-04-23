@@ -514,8 +514,20 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                 }
             }
             "mod" => do_arith(&args, |a, b| i64::rem_euclid(a, b), |a, b| a % b),
-            "=" | "==" => Ok(LispVal::Bool(args.get(0) == args.get(1))),
-            "!=" | "/=" => Ok(LispVal::Bool(args.get(0) != args.get(1))),
+            "=" | "==" => {
+                if any_float(&args) {
+                    Ok(LispVal::Bool(as_float(&args[0])? == as_float(&args[1])?))
+                } else {
+                    Ok(LispVal::Bool(args.get(0) == args.get(1)))
+                }
+            }
+            "!=" | "/=" => {
+                if any_float(&args) {
+                    Ok(LispVal::Bool(as_float(&args[0])? != as_float(&args[1])?))
+                } else {
+                    Ok(LispVal::Bool(args.get(0) != args.get(1)))
+                }
+            }
             "<" => {
                 if any_float(&args) {
                     Ok(LispVal::Bool(as_float(&args[0])? < as_float(&args[1])?))
@@ -853,6 +865,73 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                     _ => return Err("dict/merge: second arg must be map".into()),
                 }
                 Ok(LispVal::Map(m))
+            }
+
+            // --- JSON parsing ---
+            // (json-parse ...) / (from-json ...)
+            "json-parse" | "from-json" => {
+                let s = as_str(&args[0])?;
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) => Ok(json_to_lisp(v)),
+                    Err(e) => Err(format!("json-parse: {}", e)),
+                }
+            }
+            // (json-get "{\"foo\": 42}" "foo") => 42
+            // Convenience: parse + extract in one call
+            "json-get" => {
+                let s = as_str(&args[0])?;
+                let key = as_str(&args[1])?;
+                let v: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| format!("json-get: parse error: {}", e))?;
+                match v.get(&key) {
+                    Some(val) => Ok(json_to_lisp(val.clone())),
+                    None => Ok(LispVal::Nil),
+                }
+            }
+            // (json-get-in "{\"a\":{\"b\":1}}" "a" "b") => 1
+            "json-get-in" => {
+                let s = as_str(&args[0])?;
+                let v: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| format!("json-get-in: parse error: {}", e))?;
+                let mut cur = &v;
+                for arg in &args[1..] {
+                    let key = as_str(arg)?;
+                    cur = cur.get(&key).unwrap_or(&serde_json::Value::Null);
+                }
+                Ok(json_to_lisp(cur.clone()))
+            }
+
+            // --- JSON builder ---
+            // (json-build (dict "action" "REBALANCE" "lo" 412700 "hi" 413300))
+            //   => "{\"action\":\"REBALANCE\",\"lo\":412700,\"hi\":413300}"
+            "json-build" | "to-json" => {
+                let val = if args.len() == 1 {
+                    lisp_eval(&args[0], env, gas)?
+                } else {
+                    args[0].clone()
+                };
+                let j = lisp_to_json(&val);
+                Ok(LispVal::Str(j.to_string()))
+            }
+
+            // --- Storage increment ---
+            // (near/storage-inc "count" 1) => new value
+            // Atomically reads, increments, writes, returns new value
+            "near/storage-inc" => {
+                let raw_key = as_str(&args[0])?;
+                let delta: i64 = match &args[1] {
+                    LispVal::Num(n) => *n,
+                    LispVal::Float(f) => *f as i64,
+                    other => other.to_string().parse()
+                        .map_err(|_| format!("near/storage-inc: delta must be number, got {}", other))?,
+                };
+                let key = sandbox_key(&raw_key, env);
+                let current: i64 = env::storage_read(key.as_bytes())
+                    .map(|v| String::from_utf8_lossy(&v).parse::<i64>().unwrap_or(0))
+                    .unwrap_or(0);
+                let new_val = current + delta;
+                env::storage_write(key.as_bytes(), new_val.to_string().as_bytes());
+                Ok(LispVal::Num(new_val))
             }
 
             // --- Storage (namespaced by __storage_prefix__) ---

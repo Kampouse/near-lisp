@@ -28,7 +28,18 @@ pub fn json_to_lisp(val: serde_json::Value) -> LispVal {
     match val {
         serde_json::Value::Null => LispVal::Nil,
         serde_json::Value::Bool(b) => LispVal::Bool(b),
-        serde_json::Value::Number(n) => LispVal::Num(n.as_i64().unwrap_or(0)),
+        serde_json::Value::Number(n) => {
+            // Try i64 first (most common case, preserves exactness)
+            if let Some(i) = n.as_i64() {
+                LispVal::Num(i)
+            } else if let Some(f) = n.as_f64() {
+                LispVal::Float(f)
+            } else if let Some(u) = n.as_u64() {
+                LispVal::Num(u as i64)
+            } else {
+                LispVal::Num(0)
+            }
+        }
         serde_json::Value::String(s) => LispVal::Str(s),
         serde_json::Value::Array(a) => LispVal::List(a.into_iter().map(json_to_lisp).collect()),
         serde_json::Value::Object(m) => {
@@ -85,6 +96,9 @@ pub struct VmState {
     /// `Some("price")` for `(define price (near/ccall ...))`
     /// `None` for standalone `(near/ccall ...)`
     pub pending_vars: Vec<Option<String>>,
+    /// Null-safe flags for each pending ccall.
+    /// If true, failed promises return nil instead of aborting.
+    pub null_safe_flags: Vec<bool>,
     /// Optional callback for cross-contract result delivery.
     /// When set, the final result is sent as a cross-contract call
     /// instead of being returned as a receipt value.
@@ -132,16 +146,23 @@ pub struct CcallInfo {
     deposit: u128,
     /// Gas in TeraGas (50 TGas default for view calls).
     gas_tgas: u64,
+    /// If true, return nil on error instead of aborting the eval.
+    null_safe: bool,
 }
 
 /// Helper: classify a ccall function name and return its mode.
 /// Returns `None` if not a ccall function.
 fn classify_ccall(name: &str) -> Option<CcallMode> {
     match name {
-        "near/ccall" | "near/ccall-view" => Some(CcallMode::View),
-        "near/ccall-call" => Some(CcallMode::Call),
+        "near/ccall" | "near/ccall-view" | "near/ccall-view*" => Some(CcallMode::View),
+        "near/ccall-call" | "near/ccall-call*" => Some(CcallMode::Call),
         _ => None,
     }
+}
+
+/// Check if a ccall function name is the null-safe variant (returns nil on error instead of aborting).
+fn is_null_safe_ccall(name: &str) -> bool {
+    name.ends_with('*')
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -226,6 +247,7 @@ fn extract_ccall_info(
             args_bytes,
             deposit,
             gas_tgas,
+            null_safe: is_null_safe_ccall(func),
         }));
     }
     Ok(None)
@@ -409,6 +431,8 @@ pub fn run_program_with_ccall(
         // Extract pending_vars from the already-collected batch (no second scan)
         let pending_vars: Vec<Option<String>> =
             batch.iter().map(|info| info.pending_var.clone()).collect();
+        let null_safe_flags: Vec<bool> =
+            batch.iter().map(|info| info.null_safe).collect();
 
         let remaining = exprs[first_after_batch..].to_vec();
 
@@ -419,6 +443,7 @@ pub fn run_program_with_ccall(
                 env: env.clone(),
                 gas,
                 pending_vars,
+                null_safe_flags,
                 callback: None,
             },
         });
@@ -484,6 +509,8 @@ pub fn run_remaining_with_ccall(
         // Extract pending_vars from the already-collected batch (no second scan)
         let pending_vars: Vec<Option<String>> =
             batch.iter().map(|info| info.pending_var.clone()).collect();
+        let null_safe_flags: Vec<bool> =
+            batch.iter().map(|info| info.null_safe).collect();
 
         let remaining = exprs[first_after_batch..].to_vec();
 
@@ -496,6 +523,7 @@ pub fn run_remaining_with_ccall(
                 env: env.clone(),
                 gas: *gas,
                 pending_vars,
+                null_safe_flags,
                 callback: None,
             },
         });
