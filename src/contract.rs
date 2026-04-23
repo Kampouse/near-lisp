@@ -55,13 +55,13 @@ impl LispContract {
     // --- Eval access control (whitelist) ---
 
     /// Returns true if the caller is allowed to eval.
-    /// If the whitelist is empty, all callers are allowed (backward compatible).
+    /// If the whitelist is empty, only the owner is allowed.
     /// If the whitelist has entries, only whitelisted accounts may eval.
     fn is_eval_allowed(&self) -> bool {
-        if self.eval_whitelist.is_empty() {
-            return true;
-        }
         let caller = env::predecessor_account_id();
+        if self.eval_whitelist.is_empty() {
+            return caller == self.owner;
+        }
         self.eval_whitelist.contains(&caller)
     }
 
@@ -85,8 +85,24 @@ impl LispContract {
         self.eval_whitelist.remove(&account);
     }
 
-    /// View: list all accounts in the eval whitelist
+    /// Transfer ownership to a new account (owner-only).
+    pub fn transfer_owner(&mut self, new_owner: AccountId) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner,
+            "Only owner can transfer ownership"
+        );
+        self.owner = new_owner;
+    }
+
+
+    /// View: list all accounts in the eval whitelist (owner-only)
     pub fn get_eval_whitelist(&self) -> Vec<AccountId> {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.owner,
+            "Only owner can view whitelist"
+        );
         self.eval_whitelist.iter().cloned().collect()
     }
 
@@ -156,8 +172,9 @@ impl LispContract {
         }
     }
 
-    /// View: get a stored policy by name
+    /// Call: get a stored policy by name (owner-only)
     pub fn get_policy(&self, name: String) -> Option<String> {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
         env::storage_read(format!("policy:{}", name).as_bytes())
             .map(|b| String::from_utf8_lossy(&b).to_string())
     }
@@ -222,8 +239,9 @@ impl LispContract {
         ));
     }
 
-    /// View: get a stored script by name
+    /// Call: get a stored script by name (owner-only)
     pub fn get_script(&self, name: String) -> Option<String> {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
         env::storage_read(format!("script:{}", name).as_bytes())
             .map(|b| String::from_utf8_lossy(&b).to_string())
     }
@@ -278,8 +296,9 @@ impl LispContract {
         ));
     }
 
-    /// View: get a stored module by name
+    /// Call: get a stored module by name (owner-only)
     pub fn get_module(&self, name: String) -> Option<String> {
+        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
         env::storage_read(format!("module:{}", name).as_bytes())
             .map(|b| String::from_utf8_lossy(&b).to_string())
     }
@@ -403,8 +422,13 @@ impl LispContract {
     // Ownership
     // -----------------------------------------------------------------------
 
-    /// View: get the current owner
+    /// View: get the current owner (public — visible on-chain anyway)
     pub fn get_owner(&self) -> AccountId {
+        self.owner.clone()
+    }
+
+    /// View: get the current owner (alias)
+    pub fn owner(&self) -> AccountId {
         self.owner.clone()
     }
 
