@@ -200,21 +200,166 @@ The interpreter has an internal gas counter that decrements on every eval step. 
 
 ## Language reference
 
-- **Types:** nil, bool, number (i64), float (f64), string, symbol, list, lambda, dict/map
-- **Special forms:** quote, define, if, cond, let, lambda, progn, begin, and, or, not, loop/recur
-- **Arithmetic:** +, -, *, /, mod
-- **Comparison:** =, !=, <, >, <=, >= (works with mixed int/float)
-- **List ops:** list, car, cdr, cons, len, append, nth
-- **Dict ops:** dict, dict/get, dict/has?, dict/set, dict/remove, dict/keys, dict/vals, dict/merge
-- **String ops:** str-concat, str-contains, str-length, str-substring, str-split, str-trim, str-index-of, str-upcase, str-downcase, str-starts-with, str-ends-with, to-string
-- **JSON:** to-json, from-json
-- **Crypto:** sha256, keccak256
-- **Predicates:** nil?, list?, number?, string?, map?
-- **Conversion:** to-float, to-int, to-string
-- **NEAR storage:** near/storage-read, near/storage-write, near/storage-remove, near/storage-has?
-- **NEAR chain:** near/block-height, near/predecessor, near/signer, near/signer=, near/predecessor=, near/timestamp, near/log, near/account-balance, near/account-locked-balance, near/attached-deposit, near/transfer
-- **Cross-contract:** near/ccall, near/ccall-view, near/ccall-call, near/ccall-result, near/batch-result, near/ccall-count
-- **Modules:** require "math", require "list", require "string", require "crypto"
+### Types
+`nil`, `true`/`false` (bool), number (i64), float (f64), string, symbol, list, lambda, dict/map
+
+### Special forms
+| Form | Description |
+|------|-------------|
+| `(quote x)` / `'x` | Return x unevaluated |
+| `(define name expr)` | Bind name in current env |
+| `(if cond then else?)` | Conditional |
+| `(cond (test1 expr1) (test2 expr2) ... (else exprN))` | Multi-branch conditional |
+| `(let ((x 1) (y 2)) body)` | Local bindings |
+| `(lambda (params) body)` | Anonymous function |
+| `(progn expr1 expr2 ...)` / `(begin ...)` | Evaluate sequence, return last |
+| `(and a b)` / `(or a b)` | Short-circuit logic |
+| `(not x)` | Logical negation |
+| `(loop for x in lst collect expr)` | Loop with collect/sum/count |
+| `(recur args...)` | Tail-call within loop |
+| `(match expr (pattern body) ...)` | Pattern matching |
+
+### Error handling
+| Function | Description |
+|----------|-------------|
+| `(try expr (catch e fallback))` | Catch errors |
+| `(catch expr handler)` | Catch errors (simpler form) |
+| `(error msg)` | Raise error |
+
+### Arithmetic
+| Function | Description |
+|----------|-------------|
+| `(+ a b ...)` | Addition (2+ args) |
+| `(- a b)` | Subtraction |
+| `(* a b ...)` | Multiplication (2+ args) |
+| `(/ a b)` | Division |
+| `(mod a b)` | Modulo |
+
+### Comparison
+| Function | Description |
+|----------|-------------|
+| `(= a b)` | Equal (mixed int/float) |
+| `(!= a b)` | Not equal |
+| `(< a b)` / `(> a b)` / `(<= a b)` / `(>= a b)` | Ordering |
+
+### List operations
+| Function | Description |
+|----------|-------------|
+| `(list 1 2 3)` | Create list |
+| `(car lst)` | First element |
+| `(cdr lst)` | Rest of list |
+| `(cons x lst)` | Prepend element |
+| `(len lst)` | Length |
+| `(append lst1 lst2)` | Concatenate lists |
+| `(nth i lst)` | Element at index |
+| `(range start end)` | List of integers |
+| `(reverse lst)` | Reverse list |
+| `(sort lst)` | Sort ascending |
+| `(zip lst1 lst2)` | Interleave two lists |
+
+### Higher-order functions
+| Function | Description |
+|----------|-------------|
+| `(map fn lst)` | Apply fn to each element |
+| `(filter fn lst)` | Keep elements where fn returns true |
+| `(reduce fn init lst)` | Fold left |
+| `(find fn lst)` | First element matching predicate |
+| `(every fn lst)` | True if all elements match |
+
+### Dict operations
+| Function | Description |
+|----------|-------------|
+| `(dict "k1" v1 "k2" v2)` | Create dict |
+| `(dict/get d "key")` | Get value (nil if missing) |
+| `(dict/set d "key" val)` | Return new dict with key set |
+| `(dict/remove d "key")` | Return new dict with key removed |
+| `(dict/keys d)` | List of keys |
+| `(dict/vals d)` | List of values |
+| `(dict/merge d1 d2)` | Merge two dicts |
+
+### String operations
+| Function | Description |
+|----------|-------------|
+| `(str-concat a b ...)` | Concatenate strings (accepts numbers) |
+| `(str-length s)` | String length |
+| `(str-substring s start end)` | Substring |
+| `(str-split s sep)` | Split by separator |
+| `(str-trim s)` | Trim whitespace |
+| `(str-contains s substr)` | Contains substring |
+| `(str-index-of s substr)` | Index of substring |
+| `(str-starts-with s prefix)` | Starts with prefix |
+| `(str-ends-with s suffix)` | Ends with suffix |
+| `(str-upcase s)` | Uppercase |
+| `(str-downcase s)` | Lowercase |
+
+### Type predicates & conversions
+| Function | Description |
+|----------|-------------|
+| `(nil? x)` / `(list? x)` / `(number? x)` / `(string? x)` / `(map? x)` | Type checks |
+| `(to-float x)` | Convert to float |
+| `(to-int x)` | Convert to integer |
+| `(to-num x)` | Convert to number (int or float) |
+| `(to-string x)` | Convert to string |
+| `(inspect x)` | Debug representation |
+
+### JSON
+| Function | Description |
+|----------|-------------|
+| `(from-json s)` / `(json-parse s)` | Parse JSON string → Lisp value |
+| `(to-json val)` / `(json-build val)` | Lisp value → JSON string |
+| `(json-get s key)` | Parse JSON string, extract key |
+| `(json-get-in s k1 k2 ...)` | Parse JSON string, extract nested path |
+
+### Crypto
+| Function | Description |
+|----------|-------------|
+| `(sha256 s)` | SHA-256 hash |
+| `(keccak256 s)` | Keccak-256 hash |
+| `(ed25519-verify sig msg pubkey)` | Ed25519 signature verification |
+| `(ecrecover sig msg)` | Ethereum address recovery |
+
+### NEAR chain data
+| Function | Description |
+|----------|-------------|
+| `(near/block-height)` | Current block height |
+| `(near/timestamp)` | Block timestamp (nanoseconds) |
+| `(near/predecessor)` | Calling account ID |
+| `(near/signer)` | Signing account ID |
+| `(near/predecessor= "alice.near")` | Check predecessor (gas-efficient) |
+| `(near/signer= "alice.near")` | Check signer (gas-efficient) |
+| `(near/account-balance)` | Contract balance in yoctoNEAR |
+| `(near/account-locked-balance)` | Locked balance |
+| `(near/attached-deposit)` | Attached deposit amount |
+| `(near/log msg)` | Emit log event |
+| `(near/log-debug msg)` | Emit debug log (only in debug builds) |
+
+### NEAR storage
+| Function | Description |
+|----------|-------------|
+| `(near/storage-read "key")` | Read from contract storage (namespaced) |
+| `(near/storage-write "key" "val")` | Write to contract storage |
+| `(near/storage-remove "key")` | Remove key from storage |
+| `(near/storage-inc "key" delta)` | Atomic read-increment-write |
+
+### NEAR cross-contract calls
+| Function | Description |
+|----------|-------------|
+| `(near/ccall "acct" "method" "args")` | Cross-contract call (yields/resumes) |
+| `(near/ccall-view "acct" "method" "args")` | View call (returns result or nil on error) |
+| `(near/ccall-call "acct" "method" "args" deposit gas)` | Mutation call with deposit |
+| `(near/ccall-result)` | Get result of last ccall |
+| `(near/ccall-count)` | Number of pending ccalls |
+| `(near/batch-result)` | Get batch execution result |
+| `(near/batch-call "acct" "method" "args" deposit gas)` | Batched call |
+| `(near/transfer amount "recipient")` | Transfer NEAR |
+
+### Modules
+```lisp
+(require "math")    ;; abs, min, max, even?, odd?, gcd, pow, sqrt, floor, ceil, round
+(require "list")    ;; map, filter, reduce, find, every, reverse, sort, zip, range
+(require "string")  ;; enhanced string ops
+(require "crypto")  ;; sha256, keccak256, hex helpers
+```
 
 ## License
 
