@@ -1,9 +1,3 @@
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::store::IterableSet;
-use near_sdk::{
-    env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseResult,
-};
-use std::collections::{BTreeMap, HashMap};
 
 use crate::helpers::is_truthy;
 use crate::types::{Env, LispVal};
@@ -46,6 +40,7 @@ enum Op {
     /// Pop and discard top of stack
     Pop,
     /// Pop stack into binding slot
+    #[allow(dead_code)]
     StoreSlot(usize),
     /// Arithmetic: pop 2, push result
     Add,
@@ -108,6 +103,7 @@ enum Op {
 }
 
 /// Compiled loop representation.
+#[allow(dead_code)]
 pub struct CompiledLoop {
     /// Number of binding slots
     num_slots: usize,
@@ -781,8 +777,8 @@ fn remap_jump_target(op: &mut Op, index_map: &[usize]) {
 /// Run a compiled loop. Returns the result.
 fn run_compiled_loop(
     cl: &CompiledLoop,
-    gas: &mut u64,
-    outer_env: &mut Env,
+    _gas: &mut u64,
+    _outer_env: &mut Env,
 ) -> Result<LispVal, String> {
     // Slot-based env: binding slots + captured env slots, direct index access
     let mut slots: Vec<LispVal> = cl.init_vals.clone();

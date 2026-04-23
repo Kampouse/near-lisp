@@ -1,8 +1,4 @@
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::store::IterableSet;
-use near_sdk::{
-    env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseResult,
-};
 use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -14,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 pub const DEFAULT_EVAL_GAS_LIMIT: u64 = 300_000_000_000_000; // 300 Tgas
 
 /// Buffer reserved for function return / cleanup when checking real NEAR gas.
+#[allow(dead_code)]
 const GAS_BUFFER: u64 = 2_000_000_000_000; // 2 Tgas
 
 /// Check if the gas budget has been exceeded.

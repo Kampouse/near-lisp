@@ -1,9 +1,7 @@
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::store::IterableSet;
 use near_sdk::{
-    env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseResult,
+    env, AccountId, Gas, NearToken, Promise,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::bytecode::{exec_compiled_loop, try_compile_loop};
 use crate::helpers::*;
@@ -869,12 +867,18 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
 
             // --- JSON parsing ---
             // (json-parse ...) / (from-json ...)
-            "json-parse" | "from-json" => {
+            "json-parse" => {
                 let s = as_str(&args[0])?;
                 match serde_json::from_str::<serde_json::Value>(&s) {
                     Ok(v) => Ok(json_to_lisp(v)),
                     Err(e) => Err(format!("json-parse: {}", e)),
                 }
+            }
+            "from-json" => {
+                let s = as_str(&args[0]).map_err(|_| "from-json: expected string")?;
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&s).map_err(|e| format!("from-json: {}", e))?;
+                Ok(json_to_lisp(parsed))
             }
             // (json-get "{\"foo\": 42}" "foo") => 42
             // Convenience: parse + extract in one call
@@ -904,7 +908,7 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
             // --- JSON builder ---
             // (json-build (dict "action" "REBALANCE" "lo" 412700 "hi" 413300))
             //   => "{\"action\":\"REBALANCE\",\"lo\":412700,\"hi\":413300}"
-            "json-build" | "to-json" => {
+            "json-build" => {
                 let val = if args.len() == 1 {
                     lisp_eval(&args[0], env, gas)?
                 } else {
@@ -912,6 +916,13 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                 };
                 let j = lisp_to_json(&val);
                 Ok(LispVal::Str(j.to_string()))
+            }
+
+            "to-json" => {
+                let json_val = lisp_to_json(&args[0]);
+                serde_json::to_string(&json_val)
+                    .map(LispVal::Str)
+                    .map_err(|e| format!("to-json: {}", e))
             }
 
             // --- Storage increment ---
@@ -1137,19 +1148,6 @@ fn dispatch_call(list: &[LispVal], env: &mut Env, gas: &mut u64) -> Result<LispV
                     }
                 }
                 Ok(LispVal::Str(result))
-            }
-
-            "to-json" => {
-                let json_val = lisp_to_json(&args[0]);
-                serde_json::to_string(&json_val)
-                    .map(LispVal::Str)
-                    .map_err(|e| format!("to-json: {}", e))
-            }
-            "from-json" => {
-                let s = as_str(&args[0]).map_err(|_| "from-json: expected string")?;
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&s).map_err(|e| format!("from-json: {}", e))?;
-                Ok(json_to_lisp(parsed))
             }
 
             // --- List stdlib native builtins (zero stdlib gas overhead) ---

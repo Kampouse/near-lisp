@@ -1,14 +1,11 @@
-use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
+use near_sdk::borsh::{self};
 use near_sdk::store::IterableSet;
 use near_sdk::{
     env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseResult,
 };
-use std::collections::{BTreeMap, HashMap};
 
-use crate::eval::lisp_eval;
-use crate::helpers::*;
 use crate::parser::parse_all;
-use crate::types::{get_stdlib_code, Env, LispVal, DEFAULT_EVAL_GAS_LIMIT};
+use crate::types::{Env, LispVal, DEFAULT_EVAL_GAS_LIMIT};
 use crate::vm::*;
 
 #[near(contract_state)]
